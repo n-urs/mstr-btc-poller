@@ -1,0 +1,27 @@
+# Secrets — NEVER commit. Contains SEC_UA email, Groq key, Telegram bot token.
+config.env
+
+# Runtime artifacts
+*.log
+mstr_poller.log
+
+# Local state (also lives in ~/, but ignore here just in case)
+*.mstr_btc_poller_state.json
+*.mstr_btc_poller_subscribers.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local internal notes (not for public repo)
+HANDOFF.md
