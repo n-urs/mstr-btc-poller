@@ -187,9 +187,16 @@ class BtcUpdate:
     avg_price_lifetime: Optional[float]
 
     def pretty(self) -> str:
-        flag = "🟢 PURCHASE" if self.action == "purchase" else (
-            "🔴 SALE" if self.action == "sale" else "⚪ UNKNOWN-ACTION"
-        )
+        # A purchase-layout table with a zero delta is a no-activity week, not
+        # an actual purchase — label it honestly so the banner isn't misleading.
+        if self.action == "purchase" and self.btc_delta == 0:
+            flag = "⚪ NO ACTIVITY (0 BTC)"
+        elif self.action == "purchase":
+            flag = "🟢 PURCHASE"
+        elif self.action == "sale":
+            flag = "🔴 SALE"
+        else:
+            flag = "⚪ UNKNOWN-ACTION"
         unit = self.agg_price_week_unit or "?"
         lines = [
             "=" * 68,
