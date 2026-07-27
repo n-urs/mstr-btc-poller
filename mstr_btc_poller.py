@@ -505,6 +505,61 @@ def scan_for_sale_language(html: str):
     return (None, None)
 
 
+# Non-BTC crypto-asset detection. Strategy has teased diversifying beyond
+# bitcoin ("we're gonna need another color"); if an 8-K ever discloses an
+# ETH/SOL/etc position, the BTC-only table parser would report nothing at all.
+# This layer scans EVERY new 8-K (BTC update or not) for other-asset language
+# and fires its own distinct alert. Prose-based, so it works on any layout.
+#
+# Named coins: full names are case-insensitive; tickers are case-SENSITIVE and
+# word-bounded so prose like "whether" (ether), "solution" (sol) or "hyped"
+# can't false-positive.
+NEW_ASSET_NAME_RE = re.compile(
+    r"\b("
+    r"ethereum|solana|hyperliquid|ripple|dogecoin|cardano|avalanche"
+    r"|litecoin|chainlink|polkadot|toncoin|stablecoins?"
+    r")\b",
+    re.IGNORECASE,
+)
+NEW_ASSET_TICKER_RE = re.compile(
+    r"\b(ETH|SOL|HYPE|XRP|BNB|ADA|AVAX|DOGE|LTC|LINK|DOT|SUI|TON|TRX|USDC|USDT)\b"
+)
+# Generic diversification language + any non-BTC all-caps table header in the
+# style of the BTC block ("ETH Acquired", "SOL Holdings", ...).
+NEW_ASSET_GENERIC_RE = re.compile(
+    r"digital\s+assets?\s+other\s+than\s+bitcoin"
+    r"|crypto\s+assets?\s+other\s+than\s+bitcoin"
+    r"|(?!BTC\b)\b[A-Z]{2,6}\s+(?:Acquired|Sold|Holdings)\b",
+)
+
+
+def scan_for_new_assets(html: str):
+    """Returns a list of (term, context) for non-BTC crypto-asset mentions.
+
+    Empty list = nothing found. Each context is a text snippet around the hit
+    so the alert shows WHERE the term appeared. Deduped by term (uppercased);
+    capped at 5 distinct terms to keep alerts readable.
+    """
+    text = clean(html)
+    hits = []
+    seen_terms = set()
+    for regex in (NEW_ASSET_NAME_RE, NEW_ASSET_TICKER_RE, NEW_ASSET_GENERIC_RE):
+        for m in regex.finditer(text):
+            term = m.group(0).strip()
+            key = term.upper()
+            # The generic header pattern can catch benign all-caps tokens that
+            # are already known non-asset table words.
+            if key in seen_terms or key in ("USD HOLDINGS", "BTC HOLDINGS"):
+                continue
+            seen_terms.add(key)
+            start = max(0, m.start() - 60)
+            end = min(len(text), m.end() + 60)
+            hits.append((term, text[start:end].strip()))
+            if len(hits) >= 5:
+                return hits
+    return hits
+
+
 def parse_btc_update(html: str, accession: str, filed_at: str, url: str) -> Optional[BtcUpdate]:
     """
     Returns a BtcUpdate if this filing looks like a weekly BTC update,
@@ -1354,6 +1409,14 @@ def main():
                     print()
                     print(update.pretty())
 
+                # New-asset scan in backtest mode too.
+                asset_hits = scan_for_new_assets(html)
+                if asset_hits:
+                    terms = ", ".join(t for t, _ in asset_hits)
+                    print(f"🟡 NEW ASSET SIGNAL: {terms}")
+                    for t, c in asset_hits:
+                        print(f"   {t}: …{c}…")
+
                 # LLM second-opinion in backtest mode too.
                 if args.groq_api_key:
                     regex_summary = (
@@ -1604,6 +1667,28 @@ def main():
                             f"sale-related language (likely forward-looking): "
                             f"'{sale_context}' — {url}"
                         )
+
+                    # ----------------------------------------------------------------
+                    # NEW-ASSET SIGNAL: non-BTC crypto-asset language anywhere
+                    # in the filing (ETH/SOL/etc, or a non-BTC Acquired/Holdings
+                    # table header). Runs on EVERY new 8-K — including ones that
+                    # aren't BTC updates, since a first-ever altcoin disclosure
+                    # would likely be its own filing the BTC parser ignores.
+                    # ----------------------------------------------------------------
+                    asset_hits = scan_for_new_assets(html)
+                    if asset_hits:
+                        terms = ", ".join(t for t, _ in asset_hits)
+                        detail = "\n".join(f"  {t}: …{c}…" for t, c in asset_hits)
+                        msg = (f"🟡 NEW ASSET SIGNAL — non-BTC crypto-asset "
+                               f"language in 8-K {acc} ({filed_date}): {terms}\n"
+                               f"{detail}\nURL: {url}")
+                        logging.warning(msg)
+                        if not args.no_audible:
+                            audible_alert()
+                            audible_alert()
+                        if args.telegram_token:
+                            telegram_notify_all(args.telegram_token,
+                                                args.telegram_chat_id, state, msg)
 
                     # ----------------------------------------------------------------
                     # LLM second-opinion analysis (Groq, Llama 3.3 70B).
