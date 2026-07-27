@@ -539,12 +539,17 @@ def parse_btc_update(html: str, accession: str, filed_at: str, url: str) -> Opti
     else:
         action = "unknown"
 
-    # Locate the BTC-update block. There can be MULTIPLE "During Period"
-    # blocks in the same 8-K (e.g. one for ATM share sales, another for BTC).
-    # Pick the one whose IMMEDIATE neighbourhood (next ~600 chars, before the
-    # next "During Period") contains BTC keywords.
+    # Locate the BTC-update block(s). There can be MULTIPLE "During Period"
+    # blocks in the same 8-K:
+    #   - unrelated blocks (e.g. ATM share sales) — skipped, no BTC keywords;
+    #   - SEVERAL BTC blocks in a single filing. Strategy splits a reporting
+    #     week into sub-periods, each with its own BTC Sold/Acquired row and
+    #     its own running holdings total (first seen 2026-07-06: 1,363 BTC sold
+    #     in one sub-period, then 2,225 in the next). EVERY BTC block has to be
+    #     parsed and combined — reading only the first silently understates
+    #     both the weekly delta and the holdings baseline.
     period_matches = list(PATTERNS["period"].finditer(text))
-    period_match = None
+    btc_period_matches = []
     for i, pm in enumerate(period_matches):
         # Bound the look-ahead by the start of the NEXT period block, or 600
         # chars, whichever is smaller. This avoids leaking into a later block.
@@ -555,17 +560,20 @@ def parse_btc_update(html: str, accession: str, filed_at: str, url: str) -> Opti
             r"BTC\s+Acquired|BTC\s+Sold|BTC\s+Disposed|Aggregate\s+BTC\s+Holdings",
             window, re.IGNORECASE,
         ):
-            period_match = pm
-            break
-    if period_match is None and period_matches:
-        period_match = period_matches[0]
+            btc_period_matches.append(pm)
+    if not btc_period_matches and period_matches:
+        btc_period_matches = [period_matches[0]]
+    period_match = btc_period_matches[0] if btc_period_matches else None
+    last_period_match = btc_period_matches[-1] if btc_period_matches else None
 
-    # Period / as-of — pulled from the BTC block specifically.
+    # Period / as-of. The reported window spans the FIRST BTC block's start
+    # through the LAST block's end; "as of" comes from the last block, which
+    # carries the most recent holdings figure.
     period_start = period_end = as_of = None
     if period_match:
-        period_start, period_end = period_match.group(1), period_match.group(2)
-        # "As of" should be in the same block. Search forward from period_match.
-        as_of_m = PATTERNS["as_of"].search(text, period_match.start())
+        period_start = period_match.group(1)
+        period_end = last_period_match.group(2)
+        as_of_m = PATTERNS["as_of"].search(text, last_period_match.start())
         if as_of_m:
             as_of = as_of_m.group(1)
 
@@ -586,15 +594,53 @@ def parse_btc_update(html: str, accession: str, filed_at: str, url: str) -> Opti
     agg_week_unit = None
     btc_block_is_sale = False
 
-    if period_match:
-        block_start = period_match.start()
+    # Cell tokenizer (shared by both layouts).
+    CELL_RE = re.compile(
+        r"\$?\s*(?:"
+        r"\(\s*\$?\s*(?P<paren>[\d,]+(?:\.\d+)?)\s*\)"
+        r"|(?P<sign>[-−])(?P<signed>[\d,]+(?:\.\d+)?)"
+        r"|\+(?P<plus>[\d,]+(?:\.\d+)?)"
+        r"|(?P<plain>[\d,]+(?:\.\d+)?)"
+        r"|(?<![\d.])(?P<dash>[-–—])(?![\d.])"
+        r")"
+    )
+
+    def _cell_value(m):
+        if m.group("paren") is not None:
+            return -_to_float(m.group("paren"))
+        if m.group("signed") is not None:
+            return -_to_float(m.group("signed"))
+        if m.group("plus") is not None:
+            return _to_float(m.group("plus"))
+        if m.group("plain") is not None:
+            return _to_float(m.group("plain"))
+        if m.group("dash") is not None:
+            return 0.0
+        return None
+
+    def _cells_after(anchor_regex, src, n):
+        """Return up to n cell values appearing after the last match of
+        anchor_regex in src."""
+        hits = list(re.finditer(anchor_regex, src, re.IGNORECASE))
+        start = hits[-1].end() if hits else 0
+        out = []
+        for m in CELL_RE.finditer(src, pos=start):
+            out.append(_cell_value(m))
+            if len(out) >= n:
+                break
+        return out
+
+    def _block_text(pm):
+        """Text of ONE BTC block: from its "During Period" anchor up to the
+        next period block, the footnote marker, or a 2000-char cap."""
+        block_start = pm.start()
         footnote_m = re.search(
             r"\(\s*1\s*\)\s+(?:The\s+bitcoin|No\s+bitcoin|Proceeds\s+from|"
             r"Aggregate\s+and\s+average)",
             text[block_start:], re.IGNORECASE,
         )
         try:
-            pm_idx = period_matches.index(period_match)
+            pm_idx = period_matches.index(pm)
             next_pm = period_matches[pm_idx + 1] if pm_idx + 1 < len(period_matches) else None
         except ValueError:
             next_pm = None
@@ -603,8 +649,7 @@ def parse_btc_update(html: str, accession: str, filed_at: str, url: str) -> Opti
             candidates.append(block_start + footnote_m.start())
         if next_pm is not None:
             candidates.append(next_pm.start())
-        block_end = min(candidates)
-        block = text[block_start:block_end]
+        block = text[block_start:min(candidates)]
         # Strip single-digit footnote markers (1)–(9).
         block = re.sub(r"\(\s*[1-9]\s*\)", " ", block)
         # Strip dates so their digits aren't counted as data.
@@ -616,50 +661,18 @@ def parse_btc_update(html: str, accession: str, filed_at: str, url: str) -> Opti
         )
         # Strip time-of-day stamps like "4:00 p.m." that some filings include.
         block = re.sub(r"\d{1,2}:\d{2}\s*[ap]\.?m\.?", " ", block, flags=re.IGNORECASE)
+        return block
 
-        # Cell tokenizer (shared by both layouts).
-        CELL_RE = re.compile(
-            r"\$?\s*(?:"
-            r"\(\s*\$?\s*(?P<paren>[\d,]+(?:\.\d+)?)\s*\)"
-            r"|(?P<sign>[-−])(?P<signed>[\d,]+(?:\.\d+)?)"
-            r"|\+(?P<plus>[\d,]+(?:\.\d+)?)"
-            r"|(?P<plain>[\d,]+(?:\.\d+)?)"
-            r"|(?<![\d.])(?P<dash>[-–—])(?![\d.])"
-            r")"
-        )
-
-        def _cell_value(m):
-            if m.group("paren") is not None:
-                return -_to_float(m.group("paren"))
-            if m.group("signed") is not None:
-                return -_to_float(m.group("signed"))
-            if m.group("plus") is not None:
-                return _to_float(m.group("plus"))
-            if m.group("plain") is not None:
-                return _to_float(m.group("plain"))
-            if m.group("dash") is not None:
-                return 0.0
-            return None
-
-        def _cells_after(anchor_regex, src, n):
-            """Return up to n cell values appearing after the last match of
-            anchor_regex in src."""
-            hits = list(re.finditer(anchor_regex, src, re.IGNORECASE))
-            start = hits[-1].end() if hits else 0
-            out = []
-            for m in CELL_RE.finditer(src, pos=start):
-                out.append(_cell_value(m))
-                if len(out) >= n:
-                    break
-            return out
-
+    def _parse_block(block):
+        """Parse ONE BTC sub-period block into its constituent figures."""
         # Detect SALE layout: header has "BTC Sold" / "Average Sale Price".
-        btc_block_is_sale = bool(re.search(
+        is_sale = bool(re.search(
             r"BTC\s+Sold|BTC\s+Disposed|Average\s+Sale\s+Price|Aggregate\s+Sale\s+Price",
             block, re.IGNORECASE,
         ))
+        unit = None
 
-        if btc_block_is_sale:
+        if is_sale:
             # --- SALE layout ---
             # Sub-table 1: BTC Sold | Aggregate Sale Price | Average Sale Price
             # The 3 cells come right after "Average Sale Price".
@@ -668,9 +681,9 @@ def parse_btc_update(html: str, accession: str, filed_at: str, url: str) -> Opti
                 sale_cells.append(None)
             btc_sold_qty, agg_sale_price, avg_sale_price = sale_cells
             # A sale is recorded as a NEGATIVE delta.
-            btc_delta = -btc_sold_qty if btc_sold_qty is not None else None
-            agg_week = agg_sale_price
-            avg_week = avg_sale_price
+            delta = -btc_sold_qty if btc_sold_qty is not None else None
+            week_agg = agg_sale_price
+            week_avg = avg_sale_price
 
             # Sub-table 2: Aggregate BTC Holdings | Agg Purchase Price (B) |
             # Average Purchase Price. Cells come after the LAST
@@ -678,16 +691,14 @@ def parse_btc_update(html: str, accession: str, filed_at: str, url: str) -> Opti
             hold_cells = _cells_after(r"Average\s+Purchase\s+Price", block, 3)
             while len(hold_cells) < 3:
                 hold_cells.append(None)
-            holdings, agg_total_bn, avg_life = hold_cells
+            hold, total_bn, life = hold_cells
 
             # Unit of the sale price column.
             unit_hits = list(re.finditer(
                 r"\(\s*in\s+(millions?|billions?)\s*\)", block, re.IGNORECASE))
             if unit_hits:
                 u = unit_hits[0].group(1).lower()
-                agg_week_unit = "B" if u.startswith("billion") else "M"
-
-            action = "sale"  # header is authoritative here
+                unit = "B" if u.startswith("billion") else "M"
 
         else:
             # --- PURCHASE layout (classic 6-cell contiguous row) ---
@@ -701,7 +712,7 @@ def parse_btc_update(html: str, accession: str, filed_at: str, url: str) -> Opti
                     break
             while len(cells) < 6:
                 cells.append(None)
-            btc_delta, agg_week, avg_week, holdings, agg_total_bn, avg_life = cells
+            delta, week_agg, week_avg, hold, total_bn, life = cells
 
             header_part = block[:avg_iter[-1].end()] if avg_iter else block
             unit_hits = list(re.finditer(
@@ -709,19 +720,76 @@ def parse_btc_update(html: str, accession: str, filed_at: str, url: str) -> Opti
                 header_part, re.IGNORECASE))
             if unit_hits:
                 u = unit_hits[0].group(1).lower()
-                agg_week_unit = "B" if u.startswith("billion") else "M"
+                unit = "B" if u.startswith("billion") else "M"
 
+        return {
+            "is_sale": is_sale,
+            "delta": delta,
+            "agg_week": week_agg,
+            "avg_week": week_avg,
+            "holdings": hold,
+            "agg_total_bn": total_bn,
+            "avg_life": life,
+            "unit": unit,
+            "has_acquired": bool(re.search(r"BTC\s+Acquired", block, re.IGNORECASE)),
+        }
+
+    blocks = [_parse_block(_block_text(pm)) for pm in btc_period_matches]
+
+    if blocks:
+        if len(blocks) > 1:
+            logging.info(f"Filing reports {len(blocks)} BTC sub-periods — "
+                         f"combining them into a single weekly figure.")
+        btc_block_is_sale = any(b["is_sale"] for b in blocks)
+
+        # Weekly delta = sum over every sub-period.
+        deltas = [b["delta"] for b in blocks if b["delta"] is not None]
+        btc_delta = sum(deltas) if deltas else None
+
+        # Weekly $ column = sum over sub-periods. Units are normally identical;
+        # if they ever differ, normalise everything to millions.
+        weeks = [(b["agg_week"], b["unit"]) for b in blocks
+                 if b["agg_week"] is not None]
+        units = {u for _, u in weeks if u}
+        if weeks:
+            if len(units) > 1:
+                agg_week = sum(v * (1000.0 if u == "B" else 1.0) for v, u in weeks)
+                agg_week_unit = "M"
+            else:
+                agg_week = sum(v for v, _ in weeks)
+                agg_week_unit = next(iter(units), None)
+            agg_week = round(agg_week, 4)  # tidy float-summation noise
+
+        # Average price = quantity-weighted across sub-periods.
+        weighted = [(b["avg_week"], abs(b["delta"])) for b in blocks
+                    if b["avg_week"] is not None and b["delta"]]
+        wsum = sum(w for _, w in weighted)
+        if wsum:
+            avg_week = round(sum(v * w for v, w in weighted) / wsum, 2)
+        else:
+            avgs = [b["avg_week"] for b in blocks if b["avg_week"] is not None]
+            avg_week = avgs[-1] if avgs else None
+
+        # Running totals: the LAST sub-period carries the current figures.
+        for b in blocks:
+            if b["holdings"] is not None:
+                holdings = b["holdings"]
+                agg_total_bn = b["agg_total_bn"]
+                avg_life = b["avg_life"]
+
+        if btc_block_is_sale:
+            action = "sale"  # header is authoritative here
+        elif btc_delta is not None and btc_delta < 0 and action in ("purchase", "mixed", "unknown"):
             # Negative delta in a purchase-layout table = sale.
-            if btc_delta is not None and btc_delta < 0 and action in ("purchase", "mixed", "unknown"):
-                logging.info(
-                    f"Negative BTC delta ({btc_delta}) — overriding "
-                    f"action='{action}' to 'sale'."
-                )
-                action = "sale"
+            logging.info(
+                f"Negative BTC delta ({btc_delta}) — overriding "
+                f"action='{action}' to 'sale'."
+            )
+            action = "sale"
 
         # Final guard: if the block clearly is a purchase (BTC Acquired header,
         # positive delta) but whole-doc keywords made it "mixed", trust the block.
-        if not btc_block_is_sale and re.search(r"BTC\s+Acquired", block, re.IGNORECASE):
+        if not btc_block_is_sale and any(b["has_acquired"] for b in blocks):
             if action == "mixed" and (btc_delta is None or btc_delta >= 0):
                 action = "purchase"
 
