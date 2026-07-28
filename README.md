@@ -51,7 +51,8 @@ Groq are optional. `config.env` is gitignored — never commit real secrets.
 # Sanity check: parse a past filing through the full pipeline (no state change)
 python mstr_btc_poller.py --backtest 0001193125-26-249768
 
-# Verify Telegram delivery end-to-end (no filing needed)
+# Verify Telegram delivery end-to-end (no filing needed).
+# Sends ONLY to TELEGRAM_CHAT_ID (the owner) — subscribers never see tests.
 python mstr_btc_poller.py --test-telegram
 
 # Prime once before going live: mark existing 8-Ks as seen + set holdings baseline
