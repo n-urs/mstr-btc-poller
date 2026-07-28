@@ -204,9 +204,9 @@ class BtcUpdate:
             f"Accession: {self.accession}",
             f"URL: {self.primary_doc_url}",
             "-" * 68,
+            f"BTC delta (week): {self.btc_delta}",
             f"Period:           {self.period_start} → {self.period_end}",
             f"As of:            {self.as_of}",
-            f"BTC delta (week): {self.btc_delta}",
             f"Spent/Received:   ${self.agg_price_week}{unit}  @ avg ${self.avg_price_week}",
             f"Total holdings:   {self.aggregate_holdings} BTC",
             f"Cost basis (tot): ${self.agg_price_total_bn}B  @ avg ${self.avg_price_lifetime}",
@@ -563,10 +563,41 @@ def scan_for_new_assets(html: str):
             seen_terms.add(key)
             start = max(0, m.start() - 60)
             end = min(len(text), m.end() + 60)
-            hits.append((term, text[start:end].strip()))
+            ctx = text[start:end]
+            # Trim partial words at the snippet edges so alerts read cleanly.
+            if start > 0:
+                sp = ctx.find(" ")
+                if 0 <= sp < 20:
+                    ctx = ctx[sp + 1:]
+            if end < len(text):
+                sp = ctx.rfind(" ")
+                if sp > len(ctx) - 20:
+                    ctx = ctx[:sp]
+            hits.append((term, ctx.strip()))
             if len(hits) >= 5:
                 return hits
     return hits
+
+
+def format_new_asset_alert(accession: str, filed_date: str, asset_hits, url: str) -> str:
+    """Human-readable NEW ASSET SIGNAL message. The asset names/tickers go in
+    the headline; phrase-level matches (euphemisms, table headers) stay in the
+    detail list below."""
+    named, seen = [], set()
+    for t, _ in asset_hits:
+        if " " not in t and len(t) <= 12 and t.upper() not in seen:
+            named.append(t)
+            seen.add(t.upper())
+    headline = ", ".join(named) if named else "unnamed asset language"
+    lines = [f"🟡 NEW ASSET SIGNAL — {headline}",
+             f"8-K {accession}  |  filed {filed_date}",
+             ""]
+    for t, c in asset_hits:
+        lines.append(f"• {t}")
+        lines.append(f"   “…{c}…”")
+    lines.append("")
+    lines.append(url)
+    return "\n".join(lines)
 
 
 def parse_btc_update(html: str, accession: str, filed_at: str, url: str) -> Optional[BtcUpdate]:
@@ -1443,10 +1474,7 @@ def main():
                 # New-asset scan in backtest mode too.
                 asset_hits = scan_for_new_assets(html)
                 if asset_hits:
-                    terms = ", ".join(t for t, _ in asset_hits)
-                    print(f"🟡 NEW ASSET SIGNAL: {terms}")
-                    for t, c in asset_hits:
-                        print(f"   {t}: …{c}…")
+                    print(format_new_asset_alert(acc, filed_date, asset_hits, url))
 
                 # LLM second-opinion in backtest mode too.
                 if args.groq_api_key:
@@ -1716,11 +1744,7 @@ def main():
                     # ----------------------------------------------------------------
                     asset_hits = scan_for_new_assets(html)
                     if asset_hits:
-                        terms = ", ".join(t for t, _ in asset_hits)
-                        detail = "\n".join(f"  {t}: …{c}…" for t, c in asset_hits)
-                        msg = (f"🟡 NEW ASSET SIGNAL — non-BTC crypto-asset "
-                               f"language in 8-K {acc} ({filed_date}): {terms}\n"
-                               f"{detail}\nURL: {url}")
+                        msg = format_new_asset_alert(acc, filed_date, asset_hits, url)
                         logging.warning(msg)
                         if not args.no_audible:
                             audible_alert()
