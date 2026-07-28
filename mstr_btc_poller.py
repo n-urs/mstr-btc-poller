@@ -1305,25 +1305,33 @@ def main():
     # then telegram_notify_all to configured chat + all subscribers) so you can
     # confirm end-to-end delivery without waiting for a filing. Does not poll SEC.
     if args.test_telegram:
+        # Test alerts go to the OWNER chat only — never to subscribers. Real
+        # alerts (live loop) still broadcast to the configured chat + everyone
+        # who has sent /start. This also deliberately skips getUpdates-based
+        # subscriber discovery so a test run can't 409-conflict with a live
+        # poller instance polling the same bot token.
         if not args.telegram_token:
             logging.error("--test-telegram needs TELEGRAM_BOT_TOKEN (config.env) "
                           "or --telegram-token.")
             sys.exit(1)
+        if not args.telegram_chat_id:
+            logging.error("--test-telegram sends only to the owner chat and needs "
+                          "TELEGRAM_CHAT_ID (config.env) or --telegram-chat-id. "
+                          "Subscribers deliberately do NOT receive test alerts.")
+            sys.exit(1)
+        subs = state.get("telegram_subscribers", [])
+        msg = ("🧪 TEST ALERT — mstr8k poller (owner-only)\n\nIf you can read "
+               "this, end-to-end Telegram delivery works. This is a manual "
+               "test, not a real filing. Subscribers are not notified by "
+               f"tests; real alerts would broadcast to {len(subs)} "
+               "subscriber(s) plus this chat.")
         try:
-            n = telegram_discover_subscribers(args.telegram_token, state)
-            save_state(state)
-            logging.info(f"Subscriber discovery: {len(state.get('telegram_subscribers', []))} "
-                         f"total ({n} new).")
+            telegram_send(args.telegram_token, args.telegram_chat_id, msg)
+            logging.info(f"✅ Test alert sent to owner chat {args.telegram_chat_id} "
+                         f"only ({len(subs)} subscriber(s) receive real alerts).")
         except Exception as e:
-            logging.warning(f"Subscriber discovery failed: {e}")
-        msg = ("🧪 TEST ALERT — mstr8k poller\n\nIf you can read this, end-to-end "
-               "Telegram delivery works. This is a manual test, not a real filing.")
-        sent = telegram_notify_all(args.telegram_token, args.telegram_chat_id, state, msg)
-        if sent:
-            logging.info(f"✅ Test broadcast sent to {sent} recipient(s).")
-        else:
-            logging.warning("No recipients. Send /start to the bot first, or set "
-                            "TELEGRAM_CHAT_ID in config.env.")
+            logging.error(f"Test alert failed: {e}")
+            sys.exit(1)
         return
 
     # Backtest mode: fetch the given accessions and parse them as if they
