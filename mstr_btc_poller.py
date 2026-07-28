@@ -518,18 +518,26 @@ NEW_ASSET_NAME_RE = re.compile(
     r"\b("
     r"ethereum|solana|hyperliquid|ripple|dogecoin|cardano|avalanche"
     r"|litecoin|chainlink|polkadot|toncoin|stablecoins?"
+    r"|tron|monero|aptos|kaspa|algorand|hedera|filecoin|vechain"
+    r"|arbitrum|uniswap|stellar\s+lumens?|shiba\s+inu"
     r")\b",
     re.IGNORECASE,
 )
 NEW_ASSET_TICKER_RE = re.compile(
-    r"\b(ETH|SOL|HYPE|XRP|BNB|ADA|AVAX|DOGE|LTC|LINK|DOT|SUI|TON|TRX|USDC|USDT)\b"
+    r"\b(ETH|SOL|HYPE|XRP|BNB|ADA|AVAX|DOGE|LTC|LINK|DOT|SUI|TON|TRX|USDC|USDT"
+    r"|XLM|XMR|APT|ARB|KAS|ALGO|HBAR|FIL|ATOM|NEAR|ICP|UNI|AAVE|PEPE|SHIB|WBTC)\b"
 )
 # Generic diversification language + any non-BTC all-caps table header in the
-# style of the BTC block ("ETH Acquired", "SOL Holdings", ...).
+# style of the BTC block ("ETH Acquired", "SOL Holdings", ...), plus
+# unnamed-asset euphemisms ("a second reserve asset") that name no coin at all.
 NEW_ASSET_GENERIC_RE = re.compile(
     r"digital\s+assets?\s+other\s+than\s+bitcoin"
     r"|crypto\s+assets?\s+other\s+than\s+bitcoin"
-    r"|(?!BTC\b)\b[A-Z]{2,6}\s+(?:Acquired|Sold|Holdings)\b",
+    r"|(?:second|new|additional|another)\s+(?:treasury\s+|corporate\s+)?reserve\s+asset"
+    r"|(?:acquir|purchas|hold|add)\w*\s+(?:a\s+|an\s+)?(?:new\s+|second\s+|additional\s+)?"
+    r"(?:digital|crypto)\s+asset"
+    r"|(?:digital|crypto)\s+asset\s+(?:treasury|position|acquisition|purchase)"
+    r"|(?!BTC\b)\b[A-Z]{2,6}\s+(?:Acquired|Purchased|Sold|Disposed|Held|Holdings)\b",
 )
 
 
@@ -548,8 +556,9 @@ def scan_for_new_assets(html: str):
             term = m.group(0).strip()
             key = term.upper()
             # The generic header pattern can catch benign all-caps tokens that
-            # are already known non-asset table words.
-            if key in seen_terms or key in ("USD HOLDINGS", "BTC HOLDINGS"):
+            # are already known non-asset table words (USD reserve tables, the
+            # BTC block itself).
+            if key in seen_terms or key.startswith(("USD ", "BTC ")):
                 continue
             seen_terms.add(key)
             start = max(0, m.start() - 60)
@@ -1009,9 +1018,11 @@ GROQ_MODEL = "llama-3.3-70b-versatile"
 
 LLM_SYSTEM_PROMPT = """You are a precise financial-disclosure analyst.
 
-Your ONE job: given the text of a Strategy (formerly MicroStrategy) 8-K filing,
-determine whether the filing discloses an ACTUAL BITCOIN SALE that has already
-occurred during the reporting period.
+Given the text of a Strategy (formerly MicroStrategy) 8-K filing, answer TWO
+independent questions:
+
+TASK 1 — BITCOIN SALE: does the filing disclose an ACTUAL BITCOIN SALE that
+has already occurred during the reporting period?
 
 CRITICAL DISTINCTIONS:
 - A bitcoin PURCHASE is NOT a sale, even if the company also sold shares (ATM).
@@ -1023,19 +1034,31 @@ CRITICAL DISTINCTIONS:
   bitcoin" or "disposed of X BTC", OR a table with a negative bitcoin delta,
   OR explicit "BTC Sold" / "BTC Disposed" column headers with non-zero values.
 
+TASK 2 — NEW ASSET: does the filing mention the company acquiring, holding,
+planning to acquire, or adopting as a treasury/reserve asset ANY crypto or
+digital asset OTHER THAN bitcoin? This includes named coins (ether/ETH,
+Solana/SOL, Hyperliquid/HYPE, XRP, stablecoins, or any other), and unnamed
+references like "a second reserve asset" or "digital assets other than
+bitcoin". US dollars, cash reserves, and the company's own securities
+(common/preferred stock, notes) do NOT count. Bitcoin itself does NOT count.
+
 Respond with ONLY a JSON object, no other text, with these fields:
-  - sale_detected: boolean
-  - confidence: one of "low", "medium", "high"
-  - btc_sold: number or null (BTC sold this period, null if not stated)
-  - reasoning: string (one sentence, max 200 chars)
+  - sale_detected: boolean            (task 1)
+  - confidence: one of "low", "medium", "high"   (task 1 confidence)
+  - btc_sold: number or null          (BTC sold this period, null if not stated)
+  - new_asset_detected: boolean       (task 2)
+  - asset_names: array of strings     (task 2: names/tickers found, [] if none)
+  - reasoning: string (one sentence per task, max 300 chars total)
 
-Example of a forward-looking funding mention (NOT a sale):
+Example (routine purchase week, no other assets):
 {"sale_detected": false, "confidence": "high", "btc_sold": null,
- "reasoning": "Filing mentions sale of bitcoin only as a potential funding source for future note repurchases, not an executed sale."}
+ "new_asset_detected": false, "asset_names": [],
+ "reasoning": "Filing discloses only a bitcoin purchase; no other digital assets mentioned."}
 
-Example of an actual sale:
+Example (sale + new asset):
 {"sale_detected": true, "confidence": "high", "btc_sold": 1500,
- "reasoning": "Filing states the company sold 1,500 BTC during the week to fund convertible note repurchases."}
+ "new_asset_detected": true, "asset_names": ["ETH"],
+ "reasoning": "Company sold 1,500 BTC during the week; filing also discloses the purchase of 100,000 ETH as a second reserve asset."}
 """
 
 
@@ -1430,16 +1453,24 @@ def main():
                     regex_summary = (
                         f"action={update.action}, btc_delta={update.btc_delta}, "
                         f"holdings={update.aggregate_holdings}"
-                        if update is not None else "no parseable table"
+                        if update is not None else "no parseable BTC table"
                     )
+                    if asset_hits:
+                        regex_summary += (", non-BTC asset terms found: "
+                                          + ", ".join(t for t, _ in asset_hits))
+                    else:
+                        regex_summary += ", no non-BTC asset terms found"
                     llm_result = analyze_with_llm(
                         html, regex_summary, args.groq_api_key,
                         timeout=args.llm_timeout,
                     )
                     if llm_result is not None:
+                        assets = llm_result.get("asset_names") or []
                         print(f"🤖 LLM: sale_detected={llm_result.get('sale_detected')}, "
                               f"conf={llm_result.get('confidence')}, "
-                              f"btc_sold={llm_result.get('btc_sold')}")
+                              f"btc_sold={llm_result.get('btc_sold')}, "
+                              f"new_asset={llm_result.get('new_asset_detected')}"
+                              + (f" ({', '.join(str(a) for a in assets)})" if assets else ""))
                         print(f"   reasoning: {llm_result.get('reasoning')}")
                     else:
                         print("🤖 LLM: call failed or returned malformed response")
@@ -1700,11 +1731,13 @@ def main():
 
                     # ----------------------------------------------------------------
                     # LLM second-opinion analysis (Groq, Llama 3.3 70B).
-                    # Runs on every new BTC update — but ONLY after primary
-                    # alerts have already fired. Never blocks the alert path.
-                    # If it disagrees with regex, posts a separate alert.
+                    # Runs on EVERY new 8-K — including non-BTC filings, so a
+                    # novel-wording new-asset disclosure can't slip past the
+                    # regex layers unseen. Always AFTER the primary regex
+                    # alerts have been sent, so it never delays them; its
+                    # verdict goes out as its own separate Telegram message.
                     # ----------------------------------------------------------------
-                    if args.groq_api_key and (update is not None or sale_tier is not None):
+                    if args.groq_api_key:
                         # Build a regex summary for the LLM to second-guess.
                         if update is not None:
                             regex_summary = (
@@ -1716,8 +1749,13 @@ def main():
                                 regex_summary += f", holdings decreased from {holdings_decreased_from}"
                         else:
                             regex_summary = (
-                                f"no parseable table, prose-scan tier={sale_tier}"
+                                f"no parseable BTC table, prose-scan tier={sale_tier}"
                             )
+                        if asset_hits:
+                            regex_summary += (", non-BTC asset terms found: "
+                                              + ", ".join(t for t, _ in asset_hits))
+                        else:
+                            regex_summary += ", no non-BTC asset terms found"
 
                         try:
                             llm_result = analyze_with_llm(
@@ -1733,22 +1771,43 @@ def main():
                             conf = llm_result.get("confidence", "low")
                             reasoning = llm_result.get("reasoning", "")
                             btc_sold = llm_result.get("btc_sold")
+                            llm_says_asset = bool(llm_result.get("new_asset_detected"))
+                            llm_assets = llm_result.get("asset_names") or []
 
-                            # Determine regex verdict for comparison.
+                            # Determine regex verdicts for comparison.
                             regex_says_sale = bool(sale_alarms)
+                            regex_says_asset = bool(asset_hits)
 
                             llm_line = (
                                 f"🤖 LLM verdict: "
                                 f"{'SALE' if llm_says_sale else 'no sale'} "
                                 f"(conf={conf})"
                                 + (f", btc_sold={btc_sold}" if btc_sold else "")
+                                + f" | new asset: "
+                                + (f"{', '.join(str(a) for a in llm_assets) or 'YES'}"
+                                   if llm_says_asset else "none")
                                 + f" — {reasoning}"
                             )
                             logging.info(llm_line)
 
-                            # Disagreement = alert. Specifically: LLM thinks
-                            # sale, regex doesn't. (Reverse case = regex
-                            # already alarmed, no need to re-alert.)
+                            # Send the LLM verdict as its OWN Telegram message
+                            # (the regex conclusion was already sent above).
+                            # Broadcast it whenever the filing was interesting
+                            # enough that a regex message went out, or the LLM
+                            # itself found something; stay quiet on boring
+                            # non-BTC filings both layers agree are nothing.
+                            regex_broadcasted = (update is not None
+                                                 or sale_tier == "strong"
+                                                 or bool(asset_hits))
+                            if args.telegram_token and (
+                                    regex_broadcasted or llm_says_sale or llm_says_asset):
+                                telegram_notify_all(args.telegram_token,
+                                                    args.telegram_chat_id,
+                                                    state, llm_line)
+
+                            # Disagreement = escalation. LLM thinks sale,
+                            # regex doesn't. (Reverse case = regex already
+                            # alarmed, no need to re-alert.)
                             if llm_says_sale and not regex_says_sale and conf in ("medium", "high"):
                                 discrepancy_msg = (
                                     f"⚠️ LLM DISAGREES with regex — flagging possible sale "
@@ -1766,12 +1825,26 @@ def main():
                                     telegram_notify_all(args.telegram_token,
                                                         args.telegram_chat_id,
                                                         state, discrepancy_msg)
-                            # If both agree it's a sale → just confirmation,
-                            # no extra alert (primary already fired).
-                            # If both agree no sale → quiet.
+                            # New-asset escalation: LLM sees a non-BTC asset
+                            # the regex keyword net missed (novel wording).
+                            if llm_says_asset and not regex_says_asset:
+                                asset_discrepancy_msg = (
+                                    f"🟡⚠️ LLM spotted a possible NEW ASSET the regex "
+                                    f"scan missed!\n"
+                                    f"  Assets: {', '.join(str(a) for a in llm_assets) or 'unnamed'}\n"
+                                    f"  LLM reasoning: {reasoning}\n"
+                                    f"  URL: {url}"
+                                )
+                                logging.warning(asset_discrepancy_msg)
+                                if not args.no_audible:
+                                    audible_alert()
+                                if args.telegram_token:
+                                    telegram_notify_all(args.telegram_token,
+                                                        args.telegram_chat_id,
+                                                        state, asset_discrepancy_msg)
                             # If regex says sale, LLM says no → log it but
                             # trust the primary signal.
-                            elif regex_says_sale and not llm_says_sale:
+                            if regex_says_sale and not llm_says_sale:
                                 logging.info(
                                     f"Note: regex flagged sale but LLM disagrees "
                                     f"(conf={conf}). Trusting regex; check manually."
