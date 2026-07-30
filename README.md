@@ -24,7 +24,7 @@ detection layers plus an optional LLM second opinion.
   4. **Holdings delta** — any decrease vs the last known holdings baseline (the most layout-robust layer).
 - **New-asset watch** — every new 8-K (BTC update or not) is also scanned for non-BTC crypto-asset language (ETH/SOL/etc names and tickers, "digital assets other than bitcoin", or a non-BTC `X Acquired`/`X Holdings` table header). A hit fires a distinct `🟡 NEW ASSET SIGNAL` alert — coverage for a first-ever diversification disclosure the BTC parser would ignore.
 - **Optional LLM second opinion** (Groq Llama 3.3 70B) — runs on **every new 8-K** after the primary regex alerts have already been sent (its verdict arrives as a separate message and never delays them). Checks both for BTC sales AND for non-BTC asset disclosures in any wording. If it flags something the regex missed — a sale or a new asset — you get an escalation alert. Catch-all for novel layouts and novel phrasing.
-- **Two SEC feeds** (`--feed`): `submissions` (per-CIK JSON, never misses) or `getcurrent` (global firehose, often lower latency).
+- **Two SEC feeds** (`--feed`): `submissions` (per-CIK JSON, never misses), `getcurrent` (global firehose, often lower latency), or `both` — poll the two concurrently and alert from whichever detects a new filing first (shared seen-state guarantees exactly one alert; total request rate to SEC is unchanged; one throttled feed can't blind the poller).
 - **Telegram broadcast** — auto-discovers subscribers (anyone who sends `/start`) and broadcasts alerts to all of them.
 - **Health monitoring** — degraded/recovered alerts after consecutive poll failures, plus periodic heartbeat so a dead process is visible.
 - Stdlib + `requests` only.

@@ -23,6 +23,7 @@ import os
 import re
 import signal
 import sys
+import threading
 import time
 import webbrowser
 from dataclasses import dataclass, asdict
@@ -1183,27 +1184,31 @@ def audible_alert() -> None:
 class HealthMonitor:
     """Tracks consecutive failures and fires alerts when health degrades or recovers.
 
-    Behaviour:
-      - After N consecutive failures, fires a single "degraded" alert.
-      - On the next success, fires a single "recovered" alert.
-      - Emits a heartbeat log line every `heartbeat_secs` so silence is visible.
+    Multi-feed aware and thread-safe (poll workers call record_* concurrently):
+      - Failures are tracked PER FEED. The single "degraded" alert fires only
+        when EVERY feed has reached the failure threshold — one slow/blocked
+        feed while another is healthy is a log line, not an alert.
+      - On the next success from any feed, fires a single "recovered" alert.
+      - Emits a heartbeat log line every `heartbeat_secs` with per-feed status.
     """
 
     def __init__(self, telegram_token=None, telegram_chat_id=None,
                  fail_threshold=5, heartbeat_secs=300, audible=True,
-                 state=None):
+                 state=None, feeds=("poll",)):
         self.telegram_token = telegram_token
         self.telegram_chat_id = telegram_chat_id
         self.fail_threshold = fail_threshold
         self.heartbeat_secs = heartbeat_secs
         self.audible = audible
         self.state = state if state is not None else {}
+        self.feeds = list(feeds)
 
-        self.consecutive_failures = 0
+        self._lock = threading.Lock()
+        self.fail_counts = {f: 0 for f in self.feeds}
+        self.last_reasons = {f: "" for f in self.feeds}
         self.alerted_degraded = False
         self.last_success_at = time.monotonic()
         self.last_heartbeat_at = time.monotonic()
-        self.last_failure_reason = ""
 
     def _send(self, msg: str) -> None:
         logging.warning(msg)
@@ -1218,42 +1223,53 @@ class HealthMonitor:
         if self.audible:
             audible_alert()
 
-    def record_success(self) -> None:
-        self.last_success_at = time.monotonic()
-        if self.alerted_degraded:
-            self._send(
-                "✅ MSTR poller RECOVERED — successfully polling SEC again."
-            )
-            self.alerted_degraded = False
-        self.consecutive_failures = 0
-        self.last_failure_reason = ""
+    def record_success(self, feed: str) -> None:
+        send_msg = None
+        with self._lock:
+            self.last_success_at = time.monotonic()
+            self.fail_counts[feed] = 0
+            self.last_reasons[feed] = ""
+            if self.alerted_degraded:
+                via = f" (first success via {feed})" if len(self.feeds) > 1 else ""
+                send_msg = (f"✅ MSTR poller RECOVERED — successfully polling "
+                            f"SEC again{via}.")
+                self.alerted_degraded = False
+        if send_msg:
+            self._send(send_msg)
 
-    def record_failure(self, reason: str) -> None:
-        self.consecutive_failures += 1
-        self.last_failure_reason = reason
-        if (self.consecutive_failures >= self.fail_threshold
-                and not self.alerted_degraded):
-            secs_since_ok = int(time.monotonic() - self.last_success_at)
-            self._send(
-                f"⚠️ MSTR poller DEGRADED — {self.consecutive_failures} "
-                f"consecutive failures, no successful poll in {secs_since_ok}s. "
-                f"Last error: {reason}"
-            )
-            self.alerted_degraded = True
+    def record_failure(self, feed: str, reason: str) -> None:
+        send_msg = None
+        with self._lock:
+            self.fail_counts[feed] += 1
+            self.last_reasons[feed] = reason
+            if (not self.alerted_degraded
+                    and all(c >= self.fail_threshold
+                            for c in self.fail_counts.values())):
+                secs_since_ok = int(time.monotonic() - self.last_success_at)
+                detail = "; ".join(
+                    f"{f}: {self.fail_counts[f]} fails ({self.last_reasons[f]})"
+                    for f in self.feeds)
+                send_msg = (f"⚠️ MSTR poller DEGRADED — no successful poll in "
+                            f"{secs_since_ok}s across all feeds. {detail}")
+                self.alerted_degraded = True
+        if send_msg:
+            self._send(send_msg)
 
     def heartbeat(self) -> None:
-        now = time.monotonic()
-        if now - self.last_heartbeat_at >= self.heartbeat_secs:
-            secs_since_ok = int(now - self.last_success_at)
-            status = "OK" if self.consecutive_failures == 0 else (
-                f"DEGRADED ({self.consecutive_failures} fails, "
-                f"last err: {self.last_failure_reason})"
-            )
-            logging.info(
-                f"♥ heartbeat — status: {status}, "
-                f"{secs_since_ok}s since last successful poll."
-            )
+        with self._lock:
+            now = time.monotonic()
+            if now - self.last_heartbeat_at < self.heartbeat_secs:
+                return
             self.last_heartbeat_at = now
+            secs_since_ok = int(now - self.last_success_at)
+            parts = []
+            for f in self.feeds:
+                c = self.fail_counts[f]
+                parts.append(f"{f}: OK" if c == 0 else
+                             f"{f}: {c} fails (last err: {self.last_reasons[f]})")
+            line = (f"♥ heartbeat — {'; '.join(parts)}; "
+                    f"{secs_since_ok}s since last successful poll.")
+        logging.info(line)
 
 
 # ----------------------------------------------------------------------------
@@ -1291,11 +1307,15 @@ def main():
                     default=float(cfg_get("INTERVAL", DEFAULT_INTERVAL)),
                     help="Seconds between polls (default 0.20s ≈ 5/s).")
     ap.add_argument("--feed", default=cfg_get("FEED", "submissions"),
-                    choices=["submissions", "getcurrent"],
+                    choices=["submissions", "getcurrent", "both"],
                     help="Which SEC feed to poll. 'submissions' = per-CIK JSON "
                          "(data.sec.gov, 1 fetch per filing). 'getcurrent' = "
                          "global latest-filings Atom feed (often lower latency, "
-                         "2 fetches per filing). Default: submissions.")
+                         "2 fetches per filing). 'both' = poll the two feeds "
+                         "concurrently and alert from whichever detects a new "
+                         "filing first (each feed polls at half the configured "
+                         "rate so the total SEC request budget is unchanged). "
+                         "Default: submissions.")
     ap.add_argument("--prime", action="store_true",
                     help="On startup, mark all existing 8-Ks as seen (don't alert on history).")
     ap.add_argument("--once", action="store_true",
@@ -1562,11 +1582,19 @@ def main():
     signal.signal(signal.SIGINT, handle_sig)
     signal.signal(signal.SIGTERM, handle_sig)
 
-    logging.info(f"Polling SEC every {args.interval:.2f}s "
-                 f"(~{1/args.interval:.1f} req/s) via '{args.feed}' feed "
-                 f"for new MSTR 8-Ks. Already tracking {len(seen)} seen accessions.")
+    # Which feeds to poll. 'both' runs one worker thread per feed; the first
+    # feed to spot a new filing claims it (shared seen-state), so exactly one
+    # alert fires — from whichever feed was faster. Each feed polls at
+    # interval * len(feeds) so the TOTAL request rate to SEC stays at the
+    # configured budget regardless of mode.
+    feeds = ["submissions", "getcurrent"] if args.feed == "both" else [args.feed]
+    per_feed_interval = args.interval * len(feeds)
 
-    backoff = args.interval
+    logging.info(f"Polling SEC via {' + '.join(feeds)} "
+                 f"(each feed every {per_feed_interval:.2f}s, total "
+                 f"~{len(feeds)/per_feed_interval:.1f} req/s) for new MSTR "
+                 f"8-Ks. Already tracking {len(seen)} seen accessions.")
+
     health = HealthMonitor(
         telegram_token=args.telegram_token,
         telegram_chat_id=args.telegram_chat_id,
@@ -1574,7 +1602,9 @@ def main():
         heartbeat_secs=args.heartbeat_secs,
         audible=not args.no_audible,
         state=state,
+        feeds=feeds,
     )
+    state_lock = threading.RLock()
 
     # Telegram subscriber discovery: poll getUpdates every N seconds to pick
     # up anyone who has messaged the bot (/start). They opt in; no whitelist.
@@ -1591,339 +1621,380 @@ def main():
             logging.warning(f"Initial subscriber discovery failed: {e}")
         last_sub_poll = time.monotonic()
 
-    while not stop["flag"]:
-        loop_started = time.monotonic()
+    def process_filing(feed_name, acc, filed_date, fetch):
+        """Full alert pipeline for one newly-claimed filing: fetch, parse,
+        alerts, new-asset scan, LLM second opinion. Runs inside the worker
+        thread of whichever feed discovered the filing first."""
+        html, url = fetch()
+        update = parse_btc_update(html, acc, filed_date, url)
 
-        # Periodically discover new Telegram subscribers (cheap, throttled).
+        # FALLBACK: scan the prose for sale-disclosure language.
+        # Returns (tier, context). 'strong' = past-tense specific
+        # sale; 'weak' = forward-looking/discussion (e.g. listing
+        # bitcoin sales as a potential funding source).
+        sale_tier, sale_context = scan_for_sale_language(html)
+
+        # HOLDINGS-DELTA CHECK: if we have a parsed update and a
+        # previously-seen holdings figure, flag any decrease.
+        holdings_decreased_from = None
+        if update is not None and update.aggregate_holdings is not None:
+            with state_lock:
+                prev = state.get("last_holdings")
+                if prev is not None and update.aggregate_holdings < prev:
+                    holdings_decreased_from = prev
+                # Persist current holdings for next comparison.
+                state["last_holdings"] = update.aggregate_holdings
+            if holdings_decreased_from is not None and update.action == "purchase":
+                logging.warning(
+                    f"Holdings decreased {holdings_decreased_from} -> "
+                    f"{update.aggregate_holdings} but action "
+                    f"was 'purchase' - overriding to 'sale'."
+                )
+                update.action = "sale"
+
+        # Open in browser if requested.
+        should_open = False
+        if args.open:
+            if args.open_only_btc:
+                should_open = update is not None or sale_tier is not None
+            else:
+                should_open = True
+        if should_open:
+            try:
+                webbrowser.open_new_tab(url)
+                logging.info(f"Opened in browser: {url}")
+            except Exception as e:
+                logging.warning(f"Could not open browser: {e}")
+
+        # Assemble sale-signal alarms. STRONG hits only.
+        sale_alarms = []
+        if update is not None and update.action == "sale":
+            sale_alarms.append("table parsed as SALE")
+        if sale_tier == "strong":
+            sale_alarms.append(f"strong sale language: '{sale_context}'")
+        if holdings_decreased_from is not None:
+            sale_alarms.append(
+                f"holdings decreased {holdings_decreased_from} -> "
+                f"{update.aggregate_holdings}"
+            )
+
+        # Weak prose hits — note but don't sound the big alarm.
+        weak_note = None
+        if sale_tier == "weak" and not sale_alarms:
+            weak_note = (f"⚠️ Sale-related language found (may be "
+                         f"forward-looking): '{sale_context}'")
+
+        banner = None
+        if sale_alarms:
+            banner = "🚨 SALE SIGNAL — " + " | ".join(sale_alarms)
+            logging.warning(banner)
+            if not args.no_audible:
+                audible_alert()
+                audible_alert()
+
+        if update is None and sale_tier is None:
+            logging.info(f"New 8-K {acc} ({filed_date}) — not a BTC update "
+                         f"(via {feed_name}). {url}")
+        elif update is not None:
+            msg = update.pretty()
+            if banner:
+                msg = banner + "\n" + msg
+            elif weak_note:
+                msg = weak_note + "\n" + msg
+            logging.info(f"BTC update detected (via {feed_name}):\n" + msg)
+            if not args.no_audible and not sale_alarms:
+                audible_alert()
+            if args.telegram_token:
+                n = telegram_notify_all(args.telegram_token,
+                                        args.telegram_chat_id, state, msg)
+                logging.info(f"Telegram: notified {n} recipient(s).")
+        elif sale_tier == "strong":
+            msg = (f"🚨 Possible BTC sale disclosed in 8-K "
+                   f"{acc} ({filed_date}) — no parseable table.\n"
+                   f"Context: {sale_context}\nURL: {url}")
+            logging.warning(msg)
+            if args.telegram_token:
+                telegram_notify_all(args.telegram_token,
+                                    args.telegram_chat_id, state, msg)
+        elif sale_tier == "weak":
+            logging.info(
+                f"New 8-K {acc} ({filed_date}) mentions bitcoin "
+                f"sale-related language (likely forward-looking): "
+                f"'{sale_context}' — {url}"
+            )
+
+        # ----------------------------------------------------------------
+        # NEW-ASSET SIGNAL: non-BTC crypto-asset language anywhere
+        # in the filing (ETH/SOL/etc, or a non-BTC Acquired/Holdings
+        # table header). Runs on EVERY new 8-K — including ones that
+        # aren't BTC updates, since a first-ever altcoin disclosure
+        # would likely be its own filing the BTC parser ignores.
+        # ----------------------------------------------------------------
+        asset_hits = scan_for_new_assets(html)
+        if asset_hits:
+            msg = format_new_asset_alert(acc, filed_date, asset_hits, url)
+            logging.warning(msg)
+            if not args.no_audible:
+                audible_alert()
+                audible_alert()
+            if args.telegram_token:
+                telegram_notify_all(args.telegram_token,
+                                    args.telegram_chat_id, state, msg)
+
+        # ----------------------------------------------------------------
+        # LLM second-opinion analysis (Groq, Llama 3.3 70B).
+        # Runs on EVERY new 8-K — including non-BTC filings, so a
+        # novel-wording new-asset disclosure can't slip past the
+        # regex layers unseen. Always AFTER the primary regex
+        # alerts have been sent, so it never delays them; its
+        # verdict goes out as its own separate Telegram message.
+        # ----------------------------------------------------------------
+        if args.groq_api_key:
+            # Build a regex summary for the LLM to second-guess.
+            if update is not None:
+                regex_summary = (
+                    f"action={update.action}, "
+                    f"btc_delta={update.btc_delta}, "
+                    f"holdings={update.aggregate_holdings}"
+                )
+                if holdings_decreased_from is not None:
+                    regex_summary += f", holdings decreased from {holdings_decreased_from}"
+            else:
+                regex_summary = (
+                    f"no parseable BTC table, prose-scan tier={sale_tier}"
+                )
+            if asset_hits:
+                regex_summary += (", non-BTC asset terms found: "
+                                  + ", ".join(t for t, _ in asset_hits))
+            else:
+                regex_summary += ", no non-BTC asset terms found"
+
+            try:
+                llm_result = analyze_with_llm(
+                    html, regex_summary, args.groq_api_key,
+                    timeout=args.llm_timeout,
+                )
+            except Exception as e:
+                logging.warning(f"LLM call raised: {e}")
+                llm_result = None
+
+            if llm_result is not None:
+                llm_says_sale = bool(llm_result.get("sale_detected"))
+                conf = llm_result.get("confidence", "low")
+                reasoning = llm_result.get("reasoning", "")
+                btc_sold = llm_result.get("btc_sold")
+                llm_says_asset = bool(llm_result.get("new_asset_detected"))
+                llm_assets = llm_result.get("asset_names") or []
+
+                # Determine regex verdicts for comparison.
+                regex_says_sale = bool(sale_alarms)
+                regex_says_asset = bool(asset_hits)
+
+                llm_line = (
+                    f"🤖 LLM verdict: "
+                    f"{'SALE' if llm_says_sale else 'no sale'} "
+                    f"(conf={conf})"
+                    + (f", btc_sold={btc_sold}" if btc_sold else "")
+                    + f" | new asset: "
+                    + (f"{', '.join(str(a) for a in llm_assets) or 'YES'}"
+                       if llm_says_asset else "none")
+                    + f" — {reasoning}"
+                )
+                logging.info(llm_line)
+
+                # Send the LLM verdict as its OWN Telegram message
+                # (the regex conclusion was already sent above).
+                # Broadcast it whenever the filing was interesting
+                # enough that a regex message went out, or the LLM
+                # itself found something; stay quiet on boring
+                # non-BTC filings both layers agree are nothing.
+                regex_broadcasted = (update is not None
+                                     or sale_tier == "strong"
+                                     or bool(asset_hits))
+                if args.telegram_token and (
+                        regex_broadcasted or llm_says_sale or llm_says_asset):
+                    telegram_notify_all(args.telegram_token,
+                                        args.telegram_chat_id,
+                                        state, llm_line)
+
+                # Disagreement = escalation. LLM thinks sale,
+                # regex doesn't. (Reverse case = regex already
+                # alarmed, no need to re-alert.)
+                if llm_says_sale and not regex_says_sale and conf in ("medium", "high"):
+                    discrepancy_msg = (
+                        f"⚠️ LLM DISAGREES with regex — flagging possible sale "
+                        f"that regex missed!\n"
+                        f"  Regex said: {regex_summary}\n"
+                        f"  LLM said:   sale_detected=True, conf={conf}, "
+                        f"btc_sold={btc_sold}\n"
+                        f"  LLM reasoning: {reasoning}\n"
+                        f"  URL: {url}"
+                    )
+                    logging.warning(discrepancy_msg)
+                    if not args.no_audible:
+                        audible_alert()
+                    if args.telegram_token:
+                        telegram_notify_all(args.telegram_token,
+                                            args.telegram_chat_id,
+                                            state, discrepancy_msg)
+                # New-asset escalation: LLM sees a non-BTC asset
+                # the regex keyword net missed (novel wording).
+                if llm_says_asset and not regex_says_asset:
+                    asset_discrepancy_msg = (
+                        f"🟡⚠️ LLM spotted a possible NEW ASSET the regex "
+                        f"scan missed!\n"
+                        f"  Assets: {', '.join(str(a) for a in llm_assets) or 'unnamed'}\n"
+                        f"  LLM reasoning: {reasoning}\n"
+                        f"  URL: {url}"
+                    )
+                    logging.warning(asset_discrepancy_msg)
+                    if not args.no_audible:
+                        audible_alert()
+                    if args.telegram_token:
+                        telegram_notify_all(args.telegram_token,
+                                            args.telegram_chat_id,
+                                            state, asset_discrepancy_msg)
+                # If regex says sale, LLM says no → log it but
+                # trust the primary signal.
+                if regex_says_sale and not llm_says_sale:
+                    logging.info(
+                        f"Note: regex flagged sale but LLM disagrees "
+                        f"(conf={conf}). Trusting regex; check manually."
+                    )
+
+    def poll_worker(feed_name):
+        """Poll ONE feed forever. In 'both' mode two of these run concurrently;
+        the first to see a new accession claims it under the lock, so exactly
+        one alert fires per filing — from whichever feed was faster."""
+        session_w = make_session(args.user_agent)
+        backoff = per_feed_interval
+        timeout_streak = 0
+        while not stop["flag"]:
+            tick_started = time.monotonic()
+            try:
+                # Discover new filings. Both paths produce `new_filings`:
+                # dicts of accession, filed_date, fetch () -> (html, url).
+                new_filings = []
+                if feed_name == "getcurrent":
+                    feed_xml = fetch_getcurrent(session_w)
+                    for acc, filed_date, index_url, updated in iter_getcurrent_8k(feed_xml):
+                        with state_lock:
+                            if acc in seen:
+                                continue
+                        # Bind via default-args to avoid late-binding bug.
+                        def _fetch(idx=index_url, s=session_w):
+                            primary_url = resolve_primary_from_index(s, idx)
+                            if primary_url is None:
+                                raise RuntimeError(f"Could not resolve primary doc from {idx}")
+                            return fetch_doc_by_url(s, primary_url)
+                        new_filings.append({
+                            "accession": acc, "filed_date": filed_date, "fetch": _fetch,
+                        })
+                else:  # "submissions"
+                    subs_json = fetch_submissions(session_w)
+                    for acc, filed_date, primary in iter_recent_8k(subs_json):
+                        with state_lock:
+                            if acc in seen:
+                                continue
+                        def _fetch(a=acc, p=primary, s=session_w):
+                            return fetch_primary_doc(s, a, p)
+                        new_filings.append({
+                            "accession": acc, "filed_date": filed_date, "fetch": _fetch,
+                        })
+                backoff = per_feed_interval
+                timeout_streak = 0
+                health.record_success(feed_name)
+
+                # Process oldest-first so logs read naturally.
+                for filing in reversed(new_filings):
+                    acc = filing["accession"]
+                    # Claim before processing so the other feed skips it.
+                    with state_lock:
+                        if acc in seen:
+                            continue
+                        seen.add(acc)
+                        state["seen_accessions"] = sorted(seen)
+                    try:
+                        process_filing(feed_name, acc, filing["filed_date"],
+                                       filing["fetch"])
+                        with state_lock:
+                            save_state(state)
+                    except Exception as e:
+                        if isinstance(e, requests.HTTPError):
+                            logging.warning(f"[{feed_name}] HTTP error fetching {acc}: {e}")
+                        else:
+                            logging.exception(f"[{feed_name}] Error processing {acc}: {e}")
+                        # Unclaim so the filing can be retried (possibly by
+                        # the other feed) instead of being silently dropped.
+                        with state_lock:
+                            seen.discard(acc)
+                            state["seen_accessions"] = sorted(seen)
+            except requests.HTTPError as e:
+                status = e.response.status_code if e.response is not None else "?"
+                if status == 429:
+                    backoff = min(backoff * 2, 30.0)
+                    logging.warning(f"[{feed_name}] 429 from SEC — backing off "
+                                    f"to {backoff:.1f}s.")
+                    health.record_failure(feed_name, "HTTP 429 (rate limited)")
+                else:
+                    logging.warning(f"[{feed_name}] HTTP error: {e}")
+                    health.record_failure(feed_name, f"HTTP {status}")
+            except requests.ConnectionError as e:
+                logging.warning(f"[{feed_name}] Connection error (internet down?): {e}")
+                health.record_failure(feed_name, f"connection error: {type(e).__name__}")
+            except requests.Timeout:
+                # Suppress repeats: a throttled feed times out every poll and
+                # would otherwise flood the journal.
+                timeout_streak += 1
+                if timeout_streak <= 2 or timeout_streak % 30 == 0:
+                    logging.warning(f"[{feed_name}] Request timeout "
+                                    f"(x{timeout_streak} in a row).")
+                health.record_failure(feed_name, "timeout")
+            except requests.RequestException as e:
+                logging.warning(f"[{feed_name}] Network error: {e}")
+                health.record_failure(feed_name, f"network: {type(e).__name__}")
+            except Exception as e:
+                logging.exception(f"[{feed_name}] Unexpected error: {e}")
+                health.record_failure(feed_name, f"unexpected: {type(e).__name__}")
+
+            if args.once:
+                break
+
+            # Tight sleep to next tick (chunked so shutdown stays responsive).
+            elapsed = time.monotonic() - tick_started
+            sleep_for = max(0.0, backoff - elapsed)
+            if sleep_for > 0:
+                end = time.monotonic() + sleep_for
+                while not stop["flag"] and time.monotonic() < end:
+                    time.sleep(min(0.1, end - time.monotonic()))
+
+    workers = [threading.Thread(target=poll_worker, args=(f,),
+                                name=f"poll-{f}", daemon=True)
+               for f in feeds]
+    for w in workers:
+        w.start()
+
+    # Supervisor loop: Telegram subscriber discovery + heartbeat. The poll
+    # workers do all SEC traffic; this thread only does housekeeping.
+    while not stop["flag"]:
         if args.telegram_token and (time.monotonic() - last_sub_poll) >= SUB_POLL_INTERVAL:
             try:
                 new_subs = telegram_discover_subscribers(args.telegram_token, state)
                 if new_subs:
-                    save_state(state)
+                    with state_lock:
+                        save_state(state)
             except Exception as e:
                 logging.warning(f"Subscriber discovery failed: {e}")
             last_sub_poll = time.monotonic()
 
-        try:
-            # Discover new filings via the configured feed. Both paths
-            # produce `new_filings`: a list of dicts with keys
-            #   accession, filed_date, fetch  (fetch is a () -> (html, url) callable)
-            new_filings = []
-
-            if args.feed == "getcurrent":
-                feed_xml = fetch_getcurrent(session)
-                backoff = args.interval
-                health.record_success()
-                for acc, filed_date, index_url, updated in iter_getcurrent_8k(feed_xml):
-                    if acc in seen:
-                        continue
-                    # Bind index_url via default-arg to avoid late-binding bug.
-                    def _fetch(idx=index_url):
-                        primary_url = resolve_primary_from_index(session, idx)
-                        if primary_url is None:
-                            raise RuntimeError(f"Could not resolve primary doc from {idx}")
-                        return fetch_doc_by_url(session, primary_url)
-                    new_filings.append({
-                        "accession": acc, "filed_date": filed_date, "fetch": _fetch,
-                    })
-            else:  # "submissions" (default)
-                subs = fetch_submissions(session)
-                backoff = args.interval
-                health.record_success()
-                for acc, filed_date, primary in iter_recent_8k(subs):
-                    if acc in seen:
-                        continue
-                    def _fetch(a=acc, p=primary):
-                        return fetch_primary_doc(session, a, p)
-                    new_filings.append({
-                        "accession": acc, "filed_date": filed_date, "fetch": _fetch,
-                    })
-
-            # Process oldest-first so logs read naturally
-            for filing in reversed(new_filings):
-                acc = filing["accession"]
-                filed_date = filing["filed_date"]
-                try:
-                    html, url = filing["fetch"]()
-                    update = parse_btc_update(html, acc, filed_date, url)
-
-                    # FALLBACK: scan the prose for sale-disclosure language.
-                    # Returns (tier, context). 'strong' = past-tense specific
-                    # sale; 'weak' = forward-looking/discussion (e.g. listing
-                    # bitcoin sales as a potential funding source).
-                    sale_tier, sale_context = scan_for_sale_language(html)
-
-                    # HOLDINGS-DELTA CHECK: if we have a parsed update and a
-                    # previously-seen holdings figure, flag any decrease.
-                    holdings_decreased_from = None
-                    if update is not None and update.aggregate_holdings is not None:
-                        prev = state.get("last_holdings")
-                        if prev is not None and update.aggregate_holdings < prev:
-                            holdings_decreased_from = prev
-                            if update.action == "purchase":
-                                logging.warning(
-                                    f"Holdings decreased {prev} -> "
-                                    f"{update.aggregate_holdings} but action "
-                                    f"was 'purchase' - overriding to 'sale'."
-                                )
-                                update.action = "sale"
-                        # Persist current holdings for next comparison.
-                        state["last_holdings"] = update.aggregate_holdings
-
-                    # Open in browser if requested.
-                    should_open = False
-                    if args.open:
-                        if args.open_only_btc:
-                            should_open = update is not None or sale_tier is not None
-                        else:
-                            should_open = True
-                    if should_open:
-                        try:
-                            webbrowser.open_new_tab(url)
-                            logging.info(f"Opened in browser: {url}")
-                        except Exception as e:
-                            logging.warning(f"Could not open browser: {e}")
-
-                    # Assemble sale-signal alarms. STRONG hits only.
-                    sale_alarms = []
-                    if update is not None and update.action == "sale":
-                        sale_alarms.append("table parsed as SALE")
-                    if sale_tier == "strong":
-                        sale_alarms.append(f"strong sale language: '{sale_context}'")
-                    if holdings_decreased_from is not None:
-                        sale_alarms.append(
-                            f"holdings decreased {holdings_decreased_from} -> "
-                            f"{update.aggregate_holdings}"
-                        )
-
-                    # Weak prose hits — note but don't sound the big alarm.
-                    weak_note = None
-                    if sale_tier == "weak" and not sale_alarms:
-                        weak_note = (f"⚠️ Sale-related language found (may be "
-                                     f"forward-looking): '{sale_context}'")
-
-                    banner = None
-                    if sale_alarms:
-                        banner = "🚨 SALE SIGNAL — " + " | ".join(sale_alarms)
-                        logging.warning(banner)
-                        if not args.no_audible:
-                            audible_alert()
-                            audible_alert()
-
-                    if update is None and sale_tier is None:
-                        logging.info(f"New 8-K {acc} ({filed_date}) — not a BTC update. {url}")
-                    elif update is not None:
-                        msg = update.pretty()
-                        if banner:
-                            msg = banner + "\n" + msg
-                        elif weak_note:
-                            msg = weak_note + "\n" + msg
-                        logging.info("BTC update detected:\n" + msg)
-                        if not args.no_audible and not sale_alarms:
-                            audible_alert()
-                        if args.telegram_token:
-                            n = telegram_notify_all(args.telegram_token,
-                                                    args.telegram_chat_id, state, msg)
-                            logging.info(f"Telegram: notified {n} recipient(s).")
-                    elif sale_tier == "strong":
-                        msg = (f"🚨 Possible BTC sale disclosed in 8-K "
-                               f"{acc} ({filed_date}) — no parseable table.\n"
-                               f"Context: {sale_context}\nURL: {url}")
-                        logging.warning(msg)
-                        if args.telegram_token:
-                            telegram_notify_all(args.telegram_token,
-                                                args.telegram_chat_id, state, msg)
-                    elif sale_tier == "weak":
-                        logging.info(
-                            f"New 8-K {acc} ({filed_date}) mentions bitcoin "
-                            f"sale-related language (likely forward-looking): "
-                            f"'{sale_context}' — {url}"
-                        )
-
-                    # ----------------------------------------------------------------
-                    # NEW-ASSET SIGNAL: non-BTC crypto-asset language anywhere
-                    # in the filing (ETH/SOL/etc, or a non-BTC Acquired/Holdings
-                    # table header). Runs on EVERY new 8-K — including ones that
-                    # aren't BTC updates, since a first-ever altcoin disclosure
-                    # would likely be its own filing the BTC parser ignores.
-                    # ----------------------------------------------------------------
-                    asset_hits = scan_for_new_assets(html)
-                    if asset_hits:
-                        msg = format_new_asset_alert(acc, filed_date, asset_hits, url)
-                        logging.warning(msg)
-                        if not args.no_audible:
-                            audible_alert()
-                            audible_alert()
-                        if args.telegram_token:
-                            telegram_notify_all(args.telegram_token,
-                                                args.telegram_chat_id, state, msg)
-
-                    # ----------------------------------------------------------------
-                    # LLM second-opinion analysis (Groq, Llama 3.3 70B).
-                    # Runs on EVERY new 8-K — including non-BTC filings, so a
-                    # novel-wording new-asset disclosure can't slip past the
-                    # regex layers unseen. Always AFTER the primary regex
-                    # alerts have been sent, so it never delays them; its
-                    # verdict goes out as its own separate Telegram message.
-                    # ----------------------------------------------------------------
-                    if args.groq_api_key:
-                        # Build a regex summary for the LLM to second-guess.
-                        if update is not None:
-                            regex_summary = (
-                                f"action={update.action}, "
-                                f"btc_delta={update.btc_delta}, "
-                                f"holdings={update.aggregate_holdings}"
-                            )
-                            if holdings_decreased_from is not None:
-                                regex_summary += f", holdings decreased from {holdings_decreased_from}"
-                        else:
-                            regex_summary = (
-                                f"no parseable BTC table, prose-scan tier={sale_tier}"
-                            )
-                        if asset_hits:
-                            regex_summary += (", non-BTC asset terms found: "
-                                              + ", ".join(t for t, _ in asset_hits))
-                        else:
-                            regex_summary += ", no non-BTC asset terms found"
-
-                        try:
-                            llm_result = analyze_with_llm(
-                                html, regex_summary, args.groq_api_key,
-                                timeout=args.llm_timeout,
-                            )
-                        except Exception as e:
-                            logging.warning(f"LLM call raised: {e}")
-                            llm_result = None
-
-                        if llm_result is not None:
-                            llm_says_sale = bool(llm_result.get("sale_detected"))
-                            conf = llm_result.get("confidence", "low")
-                            reasoning = llm_result.get("reasoning", "")
-                            btc_sold = llm_result.get("btc_sold")
-                            llm_says_asset = bool(llm_result.get("new_asset_detected"))
-                            llm_assets = llm_result.get("asset_names") or []
-
-                            # Determine regex verdicts for comparison.
-                            regex_says_sale = bool(sale_alarms)
-                            regex_says_asset = bool(asset_hits)
-
-                            llm_line = (
-                                f"🤖 LLM verdict: "
-                                f"{'SALE' if llm_says_sale else 'no sale'} "
-                                f"(conf={conf})"
-                                + (f", btc_sold={btc_sold}" if btc_sold else "")
-                                + f" | new asset: "
-                                + (f"{', '.join(str(a) for a in llm_assets) or 'YES'}"
-                                   if llm_says_asset else "none")
-                                + f" — {reasoning}"
-                            )
-                            logging.info(llm_line)
-
-                            # Send the LLM verdict as its OWN Telegram message
-                            # (the regex conclusion was already sent above).
-                            # Broadcast it whenever the filing was interesting
-                            # enough that a regex message went out, or the LLM
-                            # itself found something; stay quiet on boring
-                            # non-BTC filings both layers agree are nothing.
-                            regex_broadcasted = (update is not None
-                                                 or sale_tier == "strong"
-                                                 or bool(asset_hits))
-                            if args.telegram_token and (
-                                    regex_broadcasted or llm_says_sale or llm_says_asset):
-                                telegram_notify_all(args.telegram_token,
-                                                    args.telegram_chat_id,
-                                                    state, llm_line)
-
-                            # Disagreement = escalation. LLM thinks sale,
-                            # regex doesn't. (Reverse case = regex already
-                            # alarmed, no need to re-alert.)
-                            if llm_says_sale and not regex_says_sale and conf in ("medium", "high"):
-                                discrepancy_msg = (
-                                    f"⚠️ LLM DISAGREES with regex — flagging possible sale "
-                                    f"that regex missed!\n"
-                                    f"  Regex said: {regex_summary}\n"
-                                    f"  LLM said:   sale_detected=True, conf={conf}, "
-                                    f"btc_sold={btc_sold}\n"
-                                    f"  LLM reasoning: {reasoning}\n"
-                                    f"  URL: {url}"
-                                )
-                                logging.warning(discrepancy_msg)
-                                if not args.no_audible:
-                                    audible_alert()
-                                if args.telegram_token:
-                                    telegram_notify_all(args.telegram_token,
-                                                        args.telegram_chat_id,
-                                                        state, discrepancy_msg)
-                            # New-asset escalation: LLM sees a non-BTC asset
-                            # the regex keyword net missed (novel wording).
-                            if llm_says_asset and not regex_says_asset:
-                                asset_discrepancy_msg = (
-                                    f"🟡⚠️ LLM spotted a possible NEW ASSET the regex "
-                                    f"scan missed!\n"
-                                    f"  Assets: {', '.join(str(a) for a in llm_assets) or 'unnamed'}\n"
-                                    f"  LLM reasoning: {reasoning}\n"
-                                    f"  URL: {url}"
-                                )
-                                logging.warning(asset_discrepancy_msg)
-                                if not args.no_audible:
-                                    audible_alert()
-                                if args.telegram_token:
-                                    telegram_notify_all(args.telegram_token,
-                                                        args.telegram_chat_id,
-                                                        state, asset_discrepancy_msg)
-                            # If regex says sale, LLM says no → log it but
-                            # trust the primary signal.
-                            if regex_says_sale and not llm_says_sale:
-                                logging.info(
-                                    f"Note: regex flagged sale but LLM disagrees "
-                                    f"(conf={conf}). Trusting regex; check manually."
-                                )
-
-                    seen.add(acc)
-                    state["seen_accessions"] = sorted(seen)
-                    save_state(state)
-                except requests.HTTPError as e:
-                    logging.warning(f"HTTP error fetching {acc}: {e}")
-                    # Per-filing fetch failure shouldn't tank loop-level health.
-                except Exception as e:
-                    logging.exception(f"Error processing {acc}: {e}")
-
-        except requests.HTTPError as e:
-            status = e.response.status_code if e.response is not None else "?"
-            if status == 429:
-                backoff = min(backoff * 2, 30.0)
-                logging.warning(f"429 from SEC — backing off to {backoff:.1f}s.")
-                health.record_failure(f"HTTP 429 (rate limited)")
-            else:
-                logging.warning(f"HTTP error: {e}")
-                health.record_failure(f"HTTP {status}")
-        except requests.ConnectionError as e:
-            logging.warning(f"Connection error (internet down?): {e}")
-            health.record_failure(f"connection error: {type(e).__name__}")
-        except requests.Timeout as e:
-            logging.warning(f"Request timeout: {e}")
-            health.record_failure("timeout")
-        except requests.RequestException as e:
-            logging.warning(f"Network error: {e}")
-            health.record_failure(f"network: {type(e).__name__}")
-        except Exception as e:
-            logging.exception(f"Unexpected error: {e}")
-            health.record_failure(f"unexpected: {type(e).__name__}")
-
         health.heartbeat()
 
-        if args.once:
-            break
+        if not any(w.is_alive() for w in workers):
+            break  # --once mode: workers each did one pass and exited
+        time.sleep(0.2)
 
-        # Tight sleep to next tick
-        elapsed = time.monotonic() - loop_started
-        sleep_for = max(0.0, backoff - elapsed)
-        if sleep_for > 0:
-            # Sleep in small chunks so signals are responsive
-            end = time.monotonic() + sleep_for
-            while not stop["flag"] and time.monotonic() < end:
-                time.sleep(min(0.1, end - time.monotonic()))
-
+    for w in workers:
+        w.join(timeout=5)
     logging.info("Bye.")
 
 
