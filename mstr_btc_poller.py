@@ -25,6 +25,7 @@ import signal
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 import webbrowser
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
@@ -57,6 +58,16 @@ DEFAULT_UA = "MSTR-BTC-Poller (set SEC_UA to your-email@example.com)"
 # Polling
 DEFAULT_INTERVAL = 0.20  # ~5 req/sec; comfortably under SEC's 10/sec ceiling
 REQUEST_TIMEOUT = 10
+
+# getcurrent pipelining: when www.sec.gov shapes traffic (observed: uniform
+# ~10.2s responses), a serial poller degrades to ~1 poll per 10s. Instead the
+# getcurrent worker keeps dispatching on schedule WITHOUT waiting for the
+# previous response, capped at this many concurrent requests. Send-rate never
+# exceeds the normal per-feed rate — concurrency only rises because responses
+# are delayed — and a throttled feed still yields a fresh snapshot every
+# ~latency/cap seconds (~1.7s at 10.2s latency). Healthy responses keep
+# in-flight at 1 and behavior is identical to serial.
+GETCURRENT_MAX_INFLIGHT = 6
 
 # Persisted state (so restarts don't re-alert on already-seen filings)
 STATE_FILE = Path.home() / ".mstr_btc_poller_state.json"
@@ -1862,73 +1873,59 @@ def main():
                         f"(conf={conf}). Trusting regex; check manually."
                     )
 
-    def poll_worker(feed_name):
-        """Poll ONE feed forever. In 'both' mode two of these run concurrently;
-        the first to see a new accession claims it under the lock, so exactly
-        one alert fires per filing — from whichever feed was faster."""
+    def claim_and_process(feed_name, new_filings):
+        """Claim each unseen filing under the lock (so the other feed skips
+        it) and run the alert pipeline. Oldest-first so logs read naturally.
+        A processing failure unclaims the filing so it can be retried,
+        possibly by the other feed."""
+        for filing in reversed(new_filings):
+            acc = filing["accession"]
+            with state_lock:
+                if acc in seen:
+                    continue
+                seen.add(acc)
+                state["seen_accessions"] = sorted(seen)
+            try:
+                process_filing(feed_name, acc, filing["filed_date"],
+                               filing["fetch"])
+                with state_lock:
+                    save_state(state)
+            except Exception as e:
+                if isinstance(e, requests.HTTPError):
+                    logging.warning(f"[{feed_name}] HTTP error fetching {acc}: {e}")
+                else:
+                    logging.exception(f"[{feed_name}] Error processing {acc}: {e}")
+                with state_lock:
+                    seen.discard(acc)
+                    state["seen_accessions"] = sorted(seen)
+
+    def submissions_worker():
+        """Serial poller for the fast per-CIK submissions JSON."""
+        feed_name = "submissions"
         session_w = make_session(args.user_agent)
         backoff = per_feed_interval
         timeout_streak = 0
         while not stop["flag"]:
             tick_started = time.monotonic()
             try:
-                # Discover new filings. Both paths produce `new_filings`:
-                # dicts of accession, filed_date, fetch () -> (html, url).
+                subs_json = fetch_submissions(session_w)
                 new_filings = []
-                if feed_name == "getcurrent":
-                    feed_xml = fetch_getcurrent(session_w)
-                    for acc, filed_date, index_url, updated in iter_getcurrent_8k(feed_xml):
-                        with state_lock:
-                            if acc in seen:
-                                continue
-                        # Bind via default-args to avoid late-binding bug.
-                        def _fetch(idx=index_url, s=session_w):
-                            primary_url = resolve_primary_from_index(s, idx)
-                            if primary_url is None:
-                                raise RuntimeError(f"Could not resolve primary doc from {idx}")
-                            return fetch_doc_by_url(s, primary_url)
-                        new_filings.append({
-                            "accession": acc, "filed_date": filed_date, "fetch": _fetch,
-                        })
-                else:  # "submissions"
-                    subs_json = fetch_submissions(session_w)
-                    for acc, filed_date, primary in iter_recent_8k(subs_json):
-                        with state_lock:
-                            if acc in seen:
-                                continue
-                        def _fetch(a=acc, p=primary, s=session_w):
-                            return fetch_primary_doc(s, a, p)
-                        new_filings.append({
-                            "accession": acc, "filed_date": filed_date, "fetch": _fetch,
-                        })
-                backoff = per_feed_interval
-                timeout_streak = 0
-                health.record_success(feed_name)
-
-                # Process oldest-first so logs read naturally.
-                for filing in reversed(new_filings):
-                    acc = filing["accession"]
-                    # Claim before processing so the other feed skips it.
+                for acc, filed_date, primary in iter_recent_8k(subs_json):
                     with state_lock:
                         if acc in seen:
                             continue
-                        seen.add(acc)
-                        state["seen_accessions"] = sorted(seen)
-                    try:
-                        process_filing(feed_name, acc, filing["filed_date"],
-                                       filing["fetch"])
-                        with state_lock:
-                            save_state(state)
-                    except Exception as e:
-                        if isinstance(e, requests.HTTPError):
-                            logging.warning(f"[{feed_name}] HTTP error fetching {acc}: {e}")
-                        else:
-                            logging.exception(f"[{feed_name}] Error processing {acc}: {e}")
-                        # Unclaim so the filing can be retried (possibly by
-                        # the other feed) instead of being silently dropped.
-                        with state_lock:
-                            seen.discard(acc)
-                            state["seen_accessions"] = sorted(seen)
+                    def _fetch(a=acc, p=primary, s=session_w):
+                        return fetch_primary_doc(s, a, p)
+                    new_filings.append({
+                        "accession": acc, "filed_date": filed_date, "fetch": _fetch,
+                    })
+                backoff = per_feed_interval
+                if timeout_streak >= 3:
+                    logging.info(f"[{feed_name}] recovered after "
+                                 f"{timeout_streak} consecutive timeouts.")
+                timeout_streak = 0
+                health.record_success(feed_name)
+                claim_and_process(feed_name, new_filings)
             except requests.HTTPError as e:
                 status = e.response.status_code if e.response is not None else "?"
                 if status == 429:
@@ -1943,8 +1940,6 @@ def main():
                 logging.warning(f"[{feed_name}] Connection error (internet down?): {e}")
                 health.record_failure(feed_name, f"connection error: {type(e).__name__}")
             except requests.Timeout:
-                # Suppress repeats: a throttled feed times out every poll and
-                # would otherwise flood the journal.
                 timeout_streak += 1
                 if timeout_streak <= 2 or timeout_streak % 30 == 0:
                     logging.warning(f"[{feed_name}] Request timeout "
@@ -1960,7 +1955,6 @@ def main():
             if args.once:
                 break
 
-            # Tight sleep to next tick (chunked so shutdown stays responsive).
             elapsed = time.monotonic() - tick_started
             sleep_for = max(0.0, backoff - elapsed)
             if sleep_for > 0:
@@ -1968,8 +1962,113 @@ def main():
                 while not stop["flag"] and time.monotonic() < end:
                     time.sleep(min(0.1, end - time.monotonic()))
 
-    workers = [threading.Thread(target=poll_worker, args=(f,),
-                                name=f"poll-{f}", daemon=True)
+    def getcurrent_worker():
+        """Pipelined poller for the global getcurrent Atom feed.
+
+        Dispatches a poll every per_feed_interval WITHOUT waiting for the
+        previous response, capped at GETCURRENT_MAX_INFLIGHT concurrent
+        requests. When SEC traffic-shapes this host (~10s responses), a
+        serial poller sees one snapshot per ~10s; pipelined, snapshots land
+        every ~latency/cap seconds while the SEND rate stays at or below the
+        normal per-feed rate. Healthy responses keep in-flight at 1."""
+        feed_name = "getcurrent"
+        session_w = make_session(args.user_agent)  # index/doc fetches
+        tls = threading.local()
+
+        def poll_once():
+            if not hasattr(tls, "session"):
+                tls.session = make_session(args.user_agent)
+            return fetch_getcurrent(tls.session)
+
+        executor = ThreadPoolExecutor(max_workers=GETCURRENT_MAX_INFLIGHT,
+                                      thread_name_prefix="gc-poll")
+        in_flight = set()
+        backoff = per_feed_interval
+        last_dispatch = 0.0
+        timeout_streak = 0
+        pipelining_logged = False
+        try:
+            while not stop["flag"]:
+                now = time.monotonic()
+                # Under 429 backoff, drain to a single serial probe; otherwise
+                # dispatch on schedule up to the concurrency cap.
+                cap = 1 if backoff > per_feed_interval else GETCURRENT_MAX_INFLIGHT
+                if (now - last_dispatch) >= backoff and len(in_flight) < cap:
+                    in_flight.add(executor.submit(poll_once))
+                    last_dispatch = now
+                    if len(in_flight) >= GETCURRENT_MAX_INFLIGHT and not pipelining_logged:
+                        logging.info(
+                            f"[{feed_name}] responses slower than dispatch rate — "
+                            f"pipelining at {GETCURRENT_MAX_INFLIGHT} concurrent "
+                            f"requests (send rate unchanged, one snapshot every "
+                            f"~{REQUEST_TIMEOUT / GETCURRENT_MAX_INFLIGHT:.1f}s+).")
+                        pipelining_logged = True
+
+                done = {f for f in in_flight if f.done()}
+                in_flight -= done
+                for fut in done:
+                    try:
+                        feed_xml = fut.result()
+                    except requests.HTTPError as e:
+                        status = e.response.status_code if e.response is not None else "?"
+                        if status == 429:
+                            backoff = min(max(backoff, per_feed_interval) * 2, 30.0)
+                            logging.warning(f"[{feed_name}] 429 from SEC — backing off "
+                                            f"to {backoff:.1f}s (draining pipeline).")
+                            health.record_failure(feed_name, "HTTP 429 (rate limited)")
+                        else:
+                            logging.warning(f"[{feed_name}] HTTP error: {e}")
+                            health.record_failure(feed_name, f"HTTP {status}")
+                    except requests.ConnectionError as e:
+                        logging.warning(f"[{feed_name}] Connection error: {e}")
+                        health.record_failure(feed_name, f"connection error: {type(e).__name__}")
+                    except requests.Timeout:
+                        timeout_streak += 1
+                        if timeout_streak <= 2 or timeout_streak % 30 == 0:
+                            logging.warning(f"[{feed_name}] Request timeout "
+                                            f"(x{timeout_streak} in a row).")
+                        health.record_failure(feed_name, "timeout")
+                    except requests.RequestException as e:
+                        logging.warning(f"[{feed_name}] Network error: {e}")
+                        health.record_failure(feed_name, f"network: {type(e).__name__}")
+                    except Exception as e:
+                        logging.exception(f"[{feed_name}] Unexpected error: {e}")
+                        health.record_failure(feed_name, f"unexpected: {type(e).__name__}")
+                    else:
+                        if timeout_streak >= 3:
+                            logging.info(f"[{feed_name}] recovered after "
+                                         f"{timeout_streak} consecutive timeouts — "
+                                         f"back in the race.")
+                        timeout_streak = 0
+                        backoff = per_feed_interval
+                        pipelining_logged = False
+                        health.record_success(feed_name)
+                        new_filings = []
+                        for acc, filed_date, index_url, updated in iter_getcurrent_8k(feed_xml):
+                            with state_lock:
+                                if acc in seen:
+                                    continue
+                            # Bind via default-args to avoid late-binding bug.
+                            def _fetch(idx=index_url, s=session_w):
+                                primary_url = resolve_primary_from_index(s, idx)
+                                if primary_url is None:
+                                    raise RuntimeError(f"Could not resolve primary doc from {idx}")
+                                return fetch_doc_by_url(s, primary_url)
+                            new_filings.append({
+                                "accession": acc, "filed_date": filed_date, "fetch": _fetch,
+                            })
+                        claim_and_process(feed_name, new_filings)
+
+                if args.once and done:
+                    break
+                time.sleep(0.05)
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+
+    workers = [threading.Thread(
+                   target=(getcurrent_worker if f == "getcurrent"
+                           else submissions_worker),
+                   name=f"poll-{f}", daemon=True)
                for f in feeds]
     for w in workers:
         w.start()
