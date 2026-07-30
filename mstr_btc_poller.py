@@ -1207,9 +1207,14 @@ class HealthMonitor:
 
     def _send(self, msg: str) -> None:
         logging.warning(msg)
-        if self.telegram_token:
-            telegram_notify_all(self.telegram_token, self.telegram_chat_id,
-                                self.state, msg)
+        # Technical/health alerts go to the OWNER chat only — never to
+        # subscribers, who should only ever receive market signal (filing
+        # alerts). Same policy as --test-telegram.
+        if self.telegram_token and self.telegram_chat_id:
+            try:
+                telegram_send(self.telegram_token, self.telegram_chat_id, msg)
+            except Exception as e:
+                logging.warning(f"Health alert send failed: {e}")
         if self.audible:
             audible_alert()
 
