@@ -743,6 +743,7 @@ def parse_btc_update(html: str, accession: str, filed_at: str, url: str) -> Opti
         block_start = pm.start()
         footnote_m = re.search(
             r"\(\s*1\s*\)\s+(?:The\s+bitcoin|No\s+bitcoin|Proceeds\s+from|"
+            r"The\s+net\s+proceeds|Net\s+proceeds|"
             r"Aggregate\s+and\s+average)",
             text[block_start:], re.IGNORECASE,
         )
@@ -756,6 +757,15 @@ def parse_btc_update(html: str, accession: str, filed_at: str, url: str) -> Opti
             candidates.append(block_start + footnote_m.start())
         if next_pm is not None:
             candidates.append(next_pm.start())
+        # Also cut at the next section heading — footnote wording changes
+        # (e.g. "The net proceeds…", 2026-08-10) have defeated the footnote
+        # regex before, letting footnote prose hijack the cell anchors.
+        section_m = re.search(
+            r"Repurchase\s+Program\s+Updates|USD\s+Reserve\s+Update|"
+            r"ATM\s+Update|Dividend\s+Update",
+            text[block_start:], re.IGNORECASE)
+        if section_m:
+            candidates.append(block_start + section_m.start())
         block = text[block_start:min(candidates)]
         # Strip single-digit footnote markers (1)–(9).
         block = re.sub(r"\(\s*[1-9]\s*\)", " ", block)
@@ -780,25 +790,31 @@ def parse_btc_update(html: str, accession: str, filed_at: str, url: str) -> Opti
         unit = None
 
         if is_sale:
-            # --- SALE layout ---
-            # Sub-table 1: BTC Sold | Aggregate Sale Price | Average Sale Price
-            # The 3 cells come right after "Average Sale Price".
-            sale_cells = _cells_after(r"Average\s+Sale\s+Price", block, 3)
-            while len(sale_cells) < 3:
-                sale_cells.append(None)
-            btc_sold_qty, agg_sale_price, avg_sale_price = sale_cells
+            # --- SALE layout, all known variants ---
+            # Whether the table is SPLIT (2026-06: two sub-tables) or
+            # CONTIGUOUS (2026-08: all six headers, then one six-value row),
+            # the values always read forward from the FIRST "Average Sale
+            # Price" header in the same order:
+            #   [btc_sold, agg_sale, avg_sale, holdings, cost_bn, avg_life]
+            # Header words contain no digits, and footnote markers/dates are
+            # already stripped, so the first six numeric cells ARE the six
+            # values — even when footnote prose (which repeats phrases like
+            # "average sale prices", and has defeated boundary regexes with
+            # novel wording twice) remains inside the block.
+            asp = re.search(r"Average\s+Sale\s+Price", block, re.IGNORECASE)
+            scan_pos = asp.end() if asp else 0
+            cells = []
+            for mm in CELL_RE.finditer(block, pos=scan_pos):
+                cells.append(_cell_value(mm))
+                if len(cells) >= 6:
+                    break
+            while len(cells) < 6:
+                cells.append(None)
+            btc_sold_qty, agg_sale_price, avg_sale_price, hold, total_bn, life = cells
             # A sale is recorded as a NEGATIVE delta.
             delta = -btc_sold_qty if btc_sold_qty is not None else None
             week_agg = agg_sale_price
             week_avg = avg_sale_price
-
-            # Sub-table 2: Aggregate BTC Holdings | Agg Purchase Price (B) |
-            # Average Purchase Price. Cells come after the LAST
-            # "Average Purchase Price".
-            hold_cells = _cells_after(r"Average\s+Purchase\s+Price", block, 3)
-            while len(hold_cells) < 3:
-                hold_cells.append(None)
-            hold, total_bn, life = hold_cells
 
             # Unit of the sale price column.
             unit_hits = list(re.finditer(
