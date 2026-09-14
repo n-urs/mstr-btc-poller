@@ -612,6 +612,102 @@ def format_new_asset_alert(accession: str, filed_date: str, asset_hits, url: str
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# PROSE layout (first seen 2026-09-08). On no-activity weeks Strategy now
+# writes a sentence instead of a table:
+#   "...during the period between September 8, 2026 and September 13, 2026,
+#    Strategy did not sell any shares under its at-the-market offering program
+#    and did not purchase or sell any bitcoin. As of September 13, 2026,
+#    Strategy holds approximately 845,050 bitcoin that were acquired at an
+#    aggregate purchase price of $63.73 billion and an average purchase price
+#    of approximately $75,412 per bitcoin..."
+# Older (2020-2024) 8-Ks used the same prose style for purchases/sales:
+#   "acquired approximately 1,045 bitcoin for approximately $97.9 million ...
+#    at an average price of approximately $93,684 per bitcoin"
+# ---------------------------------------------------------------------------
+PROSE_PERIOD_RE = re.compile(
+    r"during\s+the\s+period\s+(?:between|from)\s+([A-Z][a-z]+\s+\d{1,2},\s+\d{4})"
+    r"\s+(?:and|to|through)\s+([A-Z][a-z]+\s+\d{1,2},\s+\d{4})",
+    re.IGNORECASE,
+)
+PROSE_ZERO_RE = re.compile(
+    r"did\s+not\s+(?:purchase\s+or\s+sell|sell\s+or\s+purchase|purchase|sell|acquire)"
+    r"\s+any\s+bitcoin",
+    re.IGNORECASE,
+)
+PROSE_TXN_RE = re.compile(
+    r"(?P<verb>acquired|purchased|sold|disposed\s+of)\s+(?:approximately\s+)?"
+    r"(?P<qty>\d[\d,]*)\s+bitcoins?"
+    r"(?:\s+for\s+(?:approximately\s+)?\$(?P<amt>[\d.,]+)\s*(?P<unit>million|billion))?"
+    r"(?:.{0,140}?average\s+(?:purchase\s+|sale\s+)?price\s+of\s+(?:approximately\s+)?"
+    r"\$(?P<avg>\d[\d,]*))?",
+    re.IGNORECASE | re.DOTALL,
+)
+PROSE_HOLDINGS_RE = re.compile(
+    r"holds\s+(?:approximately\s+)?(?P<hold>\d[\d,]*)\s+bitcoins?"
+    r".{0,200}?aggregate\s+purchase\s+price\s+of\s+(?:approximately\s+)?"
+    r"\$(?P<cost>[\d.,]+)\s*billion"
+    r".{0,120}?average\s+purchase\s+price\s+of\s+(?:approximately\s+)?\$(?P<avg>\d[\d,]*)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _parse_prose_update(text: str, accession: str, filed_at: str,
+                        url: str) -> Optional[BtcUpdate]:
+    """Parse the table-less prose layout. Returns None unless a holdings
+    sentence is present — the holdings figure anchors the baseline and is
+    exactly what a garbage parse would otherwise corrupt."""
+    # Scope to the BTC section when a heading exists, so Reg-FD boilerplate
+    # ("bitcoin purchases and holdings") can't masquerade as a transaction.
+    i = text.find("BTC Update")
+    section = text[i:i + 3000] if i >= 0 else text
+    hm = PROSE_HOLDINGS_RE.search(section)
+    if not hm:
+        return None
+    holdings = _to_float(hm.group("hold"))
+    agg_total_bn = _to_float(hm.group("cost"))
+    avg_life = _to_float(hm.group("avg"))
+
+    btc_delta = agg_week = avg_week = None
+    agg_week_unit = None
+    tm = PROSE_TXN_RE.search(section)
+    if tm:
+        qty = _to_float(tm.group("qty"))
+        verb = tm.group("verb").lower()
+        if verb.startswith(("sold", "disposed")):
+            btc_delta, action = -qty, "sale"
+        else:
+            btc_delta, action = qty, "purchase"
+        if tm.group("amt"):
+            agg_week = _to_float(tm.group("amt"))
+            agg_week_unit = "B" if tm.group("unit").lower().startswith("billion") else "M"
+        if tm.group("avg"):
+            avg_week = _to_float(tm.group("avg"))
+    elif PROSE_ZERO_RE.search(section):
+        btc_delta, action = 0.0, "purchase"   # pretty() renders NO ACTIVITY
+        agg_week, avg_week, agg_week_unit = 0.0, 0.0, "M"
+    else:
+        action = "unknown"
+
+    period_start = period_end = as_of = None
+    pm = PROSE_PERIOD_RE.search(section) or PATTERNS["period"].search(section)
+    if pm:
+        period_start, period_end = pm.group(1), pm.group(2)
+    am = PATTERNS["as_of"].search(section)
+    if am:
+        as_of = am.group(1)
+    logging.info(f"Parsed prose-layout BTC update for {accession}: "
+                 f"action={action} delta={btc_delta} holdings={holdings}")
+    return BtcUpdate(
+        accession=accession, filed_at=filed_at, primary_doc_url=url,
+        action=action, period_start=period_start, period_end=period_end,
+        as_of=as_of, btc_delta=btc_delta, agg_price_week=agg_week,
+        agg_price_week_unit=agg_week_unit, avg_price_week=avg_week,
+        aggregate_holdings=holdings, agg_price_total_bn=agg_total_bn,
+        avg_price_lifetime=avg_life,
+    )
+
+
 def parse_btc_update(html: str, accession: str, filed_at: str, url: str) -> Optional[BtcUpdate]:
     """
     Returns a BtcUpdate if this filing looks like a weekly BTC update,
@@ -620,12 +716,14 @@ def parse_btc_update(html: str, accession: str, filed_at: str, url: str) -> Opti
     text = clean(html)
 
     # Quick reject: must have some BTC-update-ish language
-    has_period = PATTERNS["period"].search(text) is not None
+    has_period = (PATTERNS["period"].search(text) is not None
+                  or PROSE_PERIOD_RE.search(text) is not None)
     has_btc_keyword = (
         PATTERNS["action_purchase"].search(text) is not None
         or PATTERNS["action_sale"].search(text) is not None
         or "BTC Acquired" in text
         or "Aggregate BTC Holdings" in text
+        or PROSE_HOLDINGS_RE.search(text) is not None
     )
     if not (has_period and has_btc_keyword):
         return None
@@ -668,8 +766,13 @@ def parse_btc_update(html: str, accession: str, filed_at: str, url: str) -> Opti
             window, re.IGNORECASE,
         ):
             btc_period_matches.append(pm)
-    if not btc_period_matches and period_matches:
-        btc_period_matches = [period_matches[0]]
+    if not btc_period_matches:
+        # No table block carries BTC keywords. NEVER fall back to an
+        # unrelated "During Period" block: on 2026-09-08/14 that parsed the
+        # STRC share-repurchase table as bitcoin (1.8M "BTC"), corrupted the
+        # holdings baseline, and broadcast a false SALE SIGNAL. Try the
+        # table-less prose layout instead; None if that finds nothing.
+        return _parse_prose_update(text, accession, filed_at, url)
     period_match = btc_period_matches[0] if btc_period_matches else None
     last_period_match = btc_period_matches[-1] if btc_period_matches else None
 
@@ -1664,13 +1767,27 @@ def main():
         # HOLDINGS-DELTA CHECK: if we have a parsed update and a
         # previously-seen holdings figure, flag any decrease.
         holdings_decreased_from = None
+        parse_suspect = None
         if update is not None and update.aggregate_holdings is not None:
             with state_lock:
                 prev = state.get("last_holdings")
-                if prev is not None and update.aggregate_holdings < prev:
+                # SANITY GUARD: Strategy's largest-ever weekly move was ~4%
+                # of holdings. A jump beyond 20% is a parse error (a share
+                # count or dollar figure read as BTC), not a transaction.
+                # Never let it into the baseline or trigger a sale alarm.
+                if prev and abs(update.aggregate_holdings - prev) / prev > 0.20:
+                    parse_suspect = (
+                        f"parsed holdings {update.aggregate_holdings:,.0f} "
+                        f"deviates >20% from baseline {prev:,.0f} — treating "
+                        f"as a PARSE ERROR; baseline NOT updated. Verify "
+                        f"the filing manually.")
+                elif prev is not None and update.aggregate_holdings < prev:
                     holdings_decreased_from = prev
-                # Persist current holdings for next comparison.
-                state["last_holdings"] = update.aggregate_holdings
+                if parse_suspect is None:
+                    # Persist current holdings for next comparison.
+                    state["last_holdings"] = update.aggregate_holdings
+            if parse_suspect:
+                logging.warning(parse_suspect)
             if holdings_decreased_from is not None and update.action == "purchase":
                 logging.warning(
                     f"Holdings decreased {holdings_decreased_from} -> "
@@ -1728,6 +1845,8 @@ def main():
                 msg = banner + "\n" + msg
             elif weak_note:
                 msg = weak_note + "\n" + msg
+            if parse_suspect:
+                msg = "⚠️ PARSE SUSPECT — " + parse_suspect + "\n" + msg
             logging.info(f"BTC update detected (via {feed_name}):\n" + msg)
             if not args.no_audible and not sale_alarms:
                 audible_alert()
