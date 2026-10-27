@@ -296,7 +296,14 @@ Respond with ONLY a JSON object:
   - filing_summary: str (one line, English: what this filing is)
   - ads_info_present: boolean
   - ads_status: "decided" | "under_review" | "denied_or_no_plan" | "mentioned_other" | null
-  - ads_details: str or null (English, verbatim figures, 2-4 sentences max)
+  - ads_summary: str — EXACTLY TWO LINES (separated by "\\n"), English, about the
+    ADS/ADR issuance specifically. Line 1: whether the filing contains any
+    ADS/ADR issuance information and its status (decided / under review /
+    denied / not mentioned). Line 2: if present, the key facts with verbatim
+    figures (shares, amounts, ratio, exchange, dates); if absent, state
+    explicitly that there is no ADS/ADR, overseas-listing or new-share content
+    and what the filing covers instead. Never leave either line empty.
+  - ads_details: str or null (English, verbatim figures, up to 4 sentences)
   - confidence: "low" | "medium" | "high"
 """
 
@@ -356,13 +363,18 @@ def format_llm_message(llm: dict) -> str:
     status = llm.get("ads_status") or ""
     icon = {"decided": "🔴", "under_review": "🟠", "denied_or_no_plan": "🟢",
             "mentioned_other": "🟡"}.get(status, "🟢" if not present else "🟡")
-    lines = [f"🤖 LLM — ADS/ADR issuance info: "
-             f"{'PRESENT' if present else 'NONE'} {icon}"
+    summary = (llm.get("ads_summary") or "").strip()
+    two = [l.strip() for l in summary.split("\n") if l.strip()][:2]
+    while len(two) < 2:
+        two.append(llm.get("ads_details") or llm.get("filing_summary") or "")
+    lines = [f"🤖 ADS/ADR issuance: {'PRESENT' if present else 'NONE'} {icon}"
              + (f" ({status.replace('_', ' ')})" if present and status else "")
              + f"  [conf: {llm.get('confidence', '?')}]",
-             f"Filing: {llm.get('filing_summary', '')}"]
-    if present:
-        lines.append(f"What it says: {llm.get('ads_details', '')}")
+             f"1️⃣ {two[0]}",
+             f"2️⃣ {two[1]}"]
+    if present and llm.get("ads_details"):
+        lines.append(f"Details: {llm['ads_details']}")
+    lines.append(f"Filing: {llm.get('filing_summary', '')}")
     return "\n".join(lines)
 
 
