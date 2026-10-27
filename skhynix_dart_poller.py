@@ -27,7 +27,9 @@ import os
 import re
 import signal
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Optional
@@ -44,7 +46,8 @@ VIEWER_MAIN = "https://dart.fss.or.kr/dsaf001/main.do?rcpNo={rcp}"
 VIEWER_PART = "https://dart.fss.or.kr/report/viewer.do"
 
 DEFAULT_INTERVAL = 5.0  # RSS poll period (s). Lower it only around 08:00 KST.
-REQUEST_TIMEOUT = 15
+REQUEST_TIMEOUT = 15   # filing-content fetches
+RSS_TIMEOUT = 4        # the 1s-cadence RSS poll: a 15s timeout was a 15s blind spot
 STATE_FILE = Path.home() / ".skhynix_dart_poller_state.json"
 CONFIG_FILENAME = "config.env"
 MAX_LLM_CHARS = 60000
@@ -98,7 +101,7 @@ def make_session(ua: str) -> requests.Session:
 
 def fetch_rss(session, corp: str):
     """Yield (rcp_no, title, pub_utc_iso) newest first."""
-    r = session.get(RSS_URL.format(corp=corp), timeout=REQUEST_TIMEOUT)
+    r = session.get(RSS_URL.format(corp=corp), timeout=RSS_TIMEOUT)
     r.raise_for_status()
     r.encoding = "utf-8"
     out = []
@@ -199,6 +202,49 @@ def validate_corp(session, corp: str) -> None:
     if "하이닉스" not in name and "hynix" not in name.lower():
         raise SystemExit(f"DART corp code {corp} is not SK hynix (feed title: {name!r})")
     logging.info(f"DART feed validated: {name}")
+
+
+# ----------------------------------------------------------------------------
+# KIND (KRX) — second, racing feed. Bloomberg's edge over our DART-only poll
+# was DART's mirroring lag; KIND is the origin system for exchange filings.
+# Its "today's disclosures" POST ignores the issuer filter, so we pull the
+# KOSPI list (newest first) and pick SK hynix rows client-side.
+# ----------------------------------------------------------------------------
+
+KIND_URL = "https://kind.krx.co.kr/disclosure/todaydisclosure.do"
+KIND_TIMEOUT = 4
+KIND_ROW_RE = re.compile(
+    r"<td class=\"first txc\">(\d{2}:\d{2})</td>.*?title='([^']*)'.*?"
+    r"openDisclsViewer\('(\d+)',''\)\"?\s*title='([^']*)'",
+    re.S,
+)
+
+
+def norm_title(t: str) -> str:
+    t = _html.unescape(t)
+    t = re.sub(r"^\(유가\)SK하이닉스\s*-\s*", "", t)
+    return re.sub(r"\s+", "", t).strip()
+
+
+def fetch_kind(session, kst_date: str):
+    """Yield (acptno, hhmm, title) for SK hynix rows on KIND today, newest first."""
+    r = session.post(KIND_URL, timeout=KIND_TIMEOUT, data={
+        "method": "searchTodayDisclosureSub", "currentPageSize": "100",
+        "pageIndex": "1", "orderMode": "0", "orderStat": "D",
+        "forward": "todaydisclosure_sub", "chose": "S", "todayFlag": "Y",
+        "selDate": kst_date, "marketType": "1"},
+        headers={"Referer": KIND_URL})
+    r.raise_for_status()
+    out = []
+    for hhmm, company, acptno, title in KIND_ROW_RE.findall(r.text):
+        if "하이닉스" in company:
+            out.append((acptno, hhmm, _html.unescape(title).strip()))
+    return out
+
+
+def kst_today() -> str:
+    import datetime as _dt
+    return (_dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(hours=9)).strftime("%Y-%m-%d")
 
 
 # ----------------------------------------------------------------------------
@@ -519,34 +565,66 @@ def main():
     state = load_state()
     seen = set(state.get("seen_rcp", []))
 
+    def instant_alert(rcp, title, pub, source="DART"):
+        """Message 1 — sent the instant a filing is detected, BEFORE any
+        content fetch, so detection latency isn't padded by ~1s of HTTP."""
+        if source == "KIND":
+            link = f"https://kind.krx.co.kr/common/disclsviewer.do?method=search&acptno={rcp}"
+            ident = f"KIND no. {rcp}"
+        else:
+            link = f"https://dart.fss.or.kr/dsaf001/main.do?rcpNo={rcp}"
+            ident = f"rcpNo {rcp}"
+        msg = (f"🇰🇷 NEW SK hynix filing — {title}\n"
+               f"{pub}  |  {ident}  |  via {source}\n{link}\n"
+               f"(keyword scan + LLM verdicts follow)")
+        logging.info(msg)
+        notify_owner(args.telegram_token, args.telegram_chat_id, msg)
+
     def process(rcp, title, pub, notify=True):
+        """Fetch + keyword scan (message 2), then BOTH LLM passes in parallel
+        (messages 3/4, each sent the moment it completes). Runs in a worker
+        thread per filing so a burst never queues behind one filing's LLMs."""
         text = fetch_filing_text(session, rcp)
         logging.info(f"Fetched {len(text)} chars for {rcp} ({title})")
         hits = scan_ads(text)
-        msg1 = format_filing_alert(rcp, title, pub, hits)
+        msg = format_filing_alert(rcp, title, pub, hits)
         if len(text) < 40:
-            msg1 = ("⚠️ FILING TEXT COULD NOT BE FETCHED — open the link and read it "
-                    "manually. (LLM skipped: no content to judge.)\n\n" + msg1)
-        logging.info("New filing:\n" + msg1)
+            msg = ("⚠️ FILING TEXT COULD NOT BE FETCHED — open the link and read it "
+                   "manually. (LLM skipped: no content to judge.)\n\n" + msg)
+        logging.info("Keyword scan:\n" + msg)
         if notify:
-            notify_owner(args.telegram_token, args.telegram_chat_id, msg1)
-        if args.groq_api_key and len(text) >= 40:
+            notify_owner(args.telegram_token, args.telegram_chat_id, msg)
+        if len(text) < 40:
+            return hits
+
+        def groq_pass():
             llm = analyze_with_llm(text, title, args.groq_api_key, args.groq_model, args.llm_timeout)
-            msg2 = (format_llm_message(llm, f"🤖 {args.groq_model}") if llm
+            return (format_llm_message(llm, f"🤖 {args.groq_model}") if llm
                     else f"🤖 {args.groq_model} call failed — no answer for this filing; read it manually.")
-            logging.info(msg2)
-            if notify:
-                notify_owner(args.telegram_token, args.telegram_chat_id, msg2)
-        # Second, independent opinion (OpenAI) — its own separate alert.
-        if len(text) >= 40 and (args.openai_api_key or args.openai_model):
+
+        def openai_pass():
             oai, err = analyze_with_openai(text, title, args.openai_api_key,
                                            args.openai_model, args.openai_reasoning_effort,
                                            args.openai_extra_json, args.llm_timeout)
-            msg3 = (format_llm_message(oai, f"🧠 {args.openai_model}") if oai
-                    else f"🧠 {args.openai_model} unavailable — {err}")
-            logging.info(msg3)
-            if notify and (oai or args.openai_api_key):
-                notify_owner(args.telegram_token, args.telegram_chat_id, msg3)
+            if oai:
+                return format_llm_message(oai, f"🧠 {args.openai_model}")
+            return f"🧠 {args.openai_model} unavailable — {err}" if args.openai_api_key else None
+
+        jobs = []
+        with ThreadPoolExecutor(max_workers=2, thread_name_prefix=f"llm-{rcp[-4:]}") as ex:
+            if args.groq_api_key:
+                jobs.append(ex.submit(groq_pass))
+            if args.openai_api_key or args.openai_model:
+                jobs.append(ex.submit(openai_pass))
+            for fut in as_completed(jobs):
+                try:
+                    out = fut.result()
+                except Exception as e:
+                    out = f"LLM pass raised: {e}"
+                if out:
+                    logging.info(out)
+                    if notify:
+                        notify_owner(args.telegram_token, args.telegram_chat_id, out)
         return hits
 
     if args.test_telegram:
@@ -568,12 +646,19 @@ def main():
 
     validate_corp(session, args.corp_code)
 
+    seen_kind = set(state.get("seen_kind", []))
     if args.prime:
         for rcp, _, _ in fetch_rss(session, args.corp_code):
             seen.add(rcp)
+        try:
+            for acptno, _, _ in fetch_kind(session, kst_today()):
+                seen_kind.add(acptno)
+        except Exception as e:
+            logging.warning(f"KIND prime failed (DART-only prime): {e}")
         state["seen_rcp"] = sorted(seen)
+        state["seen_kind"] = sorted(seen_kind)
         save_state(state)
-        logging.info(f"Primed: {len(seen)} filing(s) marked seen.")
+        logging.info(f"Primed: {len(seen)} DART + {len(seen_kind)} KIND filing(s) marked seen.")
         return
 
     stop = {"flag": False}
@@ -597,6 +682,76 @@ def main():
     # first 200 would just re-trip the limit. Repeated failures while boxed
     # still back off exponentially (capped at 60s).
     safe_until = 0.0
+    # One worker per in-flight filing: fetch + keyword scan + both LLM passes
+    # happen off the polling thread, so polling never pauses and filings in a
+    # burst are processed concurrently.
+    workers = ThreadPoolExecutor(max_workers=4, thread_name_prefix="filing")
+
+    # ---- KIND racing feed (own thread, own session, own backoff) ----
+    # pending_kind: norm_title -> (acptno, monotonic time) for filings KIND
+    # announced that DART hasn't mirrored yet. When the DART item shows up we
+    # skip the duplicate instant alert, log the mirror lag, and use DART for
+    # the text/LLM passes (DART's viewer is the proven content path).
+    state_lock = threading.Lock()
+    pending_kind = {}
+    kind_stats = {"n": 0, "codes": {}, "lat": []}
+
+    def kind_worker():
+        ks = make_session(args.user_agent)
+        backoff = args.interval
+        while not stop["flag"]:
+            t0 = time.monotonic()
+            try:
+                rows = fetch_kind(ks, kst_today())
+                lat = time.monotonic() - t0
+                with state_lock:
+                    kind_stats["n"] += 1; kind_stats["lat"].append(lat)
+                    kind_stats["codes"]["200"] = kind_stats["codes"].get("200", 0) + 1
+                backoff = args.interval
+                for acptno, hhmm, title in reversed(rows):
+                    with state_lock:
+                        if acptno in seen_kind:
+                            continue
+                        seen_kind.add(acptno)
+                        state["seen_kind"] = sorted(seen_kind)
+                        save_state(state)
+                        already_on_dart = norm_title(title) in dart_recent_titles
+                        if not already_on_dart:
+                            pending_kind[norm_title(title)] = (acptno, time.monotonic())
+                    if already_on_dart:
+                        logging.info(f"KIND {acptno} '{title}' — DART already had it; no duplicate alert.")
+                    else:
+                        instant_alert(acptno, title, f"{hhmm} KST", source="KIND")
+            except requests.HTTPError as e:
+                code = e.response.status_code if e.response is not None else "?"
+                with state_lock:
+                    kind_stats["n"] += 1
+                    kind_stats["codes"][str(code)] = kind_stats["codes"].get(str(code), 0) + 1
+                if code in (403, 429, 500, 502, 503):
+                    backoff = min(max(backoff, args.safe_interval) * 2, 60.0)
+                    logging.warning(f"[KIND] HTTP {code} — backing off to {backoff:.0f}s")
+            except requests.RequestException as e:
+                with state_lock:
+                    kind_stats["n"] += 1
+                    kind_stats["codes"][type(e).__name__] = kind_stats["codes"].get(type(e).__name__, 0) + 1
+            except Exception as e:
+                logging.exception(f"[KIND] unexpected: {e}")
+            end = time.monotonic() + max(0.0, backoff - (time.monotonic() - t0))
+            while not stop["flag"] and time.monotonic() < end:
+                time.sleep(min(0.2, end - time.monotonic()))
+
+    dart_recent_titles = set()
+    kind_enabled = cfg_get("KIND_ENABLED", "true").lower() in ("1", "true", "yes")
+    if kind_enabled:
+        kind_thread = threading.Thread(target=kind_worker, name="poll-kind", daemon=True)
+        kind_thread.start()
+        logging.info("KIND racing feed started (1s, KOSPI today list filtered to SK hynix).")
+    else:
+        # KIND returns HTTP 403 to this host's honest User-Agent (observed from
+        # the Tokyo VPS on 2026-10-28); we do not spoof browsers to get around
+        # that. DART-only until KIND is reachable from wherever this runs.
+        logging.info("KIND racing feed DISABLED by config (KIND_ENABLED=false); DART only.")
+
     while not stop["flag"]:
         tick = time.monotonic()
         try:
@@ -618,17 +773,34 @@ def main():
                 safe_until = 0.0
                 backoff = args.interval
             health.ok()
-            for rcp, title, pub in reversed([i for i in items if i[0] not in seen]):
-                try:
-                    process(rcp, title, pub)
-                except Exception as e:
-                    logging.exception(f"Error processing {rcp}: {e}")
-                    notify_owner(args.telegram_token, args.telegram_chat_id,
-                                 f"⚠️ New SK hynix filing {rcp} ({title}) detected but processing "
-                                 f"failed: {e}\nhttps://dart.fss.or.kr/dsaf001/main.do?rcpNo={rcp}")
-                seen.add(rcp)
-                state["seen_rcp"] = sorted(seen)
-                save_state(state)
+            new_items = [i for i in items if i[0] not in seen]
+            for rcp, title, pub in reversed(new_items):
+                # Claim + persist first, then the instant alert, then hand the
+                # heavy work to a worker thread and keep polling. A burst of N
+                # filings yields N instant alerts within the same second.
+                with state_lock:
+                    seen.add(rcp)
+                    state["seen_rcp"] = sorted(seen)
+                    save_state(state)
+                    dart_recent_titles.add(norm_title(title))
+                    kind_first = pending_kind.pop(norm_title(title), None)
+                if kind_first:
+                    lag = time.monotonic() - kind_first[1]
+                    logging.info(f"DART mirror for '{title}' arrived {lag:.1f}s after KIND "
+                                 f"(KIND {kind_first[0]} -> DART {rcp}); instant alert already sent.")
+                else:
+                    instant_alert(rcp, title, pub)
+
+                def _job(rcp=rcp, title=title, pub=pub):
+                    try:
+                        process(rcp, title, pub)
+                    except Exception as e:
+                        logging.exception(f"Error processing {rcp}: {e}")
+                        notify_owner(args.telegram_token, args.telegram_chat_id,
+                                     f"⚠️ SK hynix filing {rcp} ({title}): content/LLM processing "
+                                     f"failed: {e} — read it manually:\n"
+                                     f"https://dart.fss.or.kr/dsaf001/main.do?rcpNo={rcp}")
+                workers.submit(_job)
         except requests.HTTPError as e:
             code = e.response.status_code if e.response is not None else "?"
             stats["n"] += 1
@@ -660,10 +832,16 @@ def main():
             health.fail(type(e).__name__)
         if time.monotonic() - stats["since"] >= 60:
             lats = stats["lat"]
-            logging.info(f"📊 last 60s: polls={stats['n']} codes={stats['codes']} "
+            with state_lock:
+                kl = kind_stats["lat"]
+                kind_line = (f" | KIND polls={kind_stats['n']} codes={kind_stats['codes']} "
+                             f"avg={(sum(kl)/len(kl)*1000 if kl else 0):.0f}ms "
+                             f"max={(max(kl)*1000 if kl else 0):.0f}ms pending={len(pending_kind)}")
+                kind_stats.update({"n": 0, "codes": {}, "lat": []})
+            logging.info(f"📊 last 60s: DART polls={stats['n']} codes={stats['codes']} "
                          f"latency avg={(sum(lats)/len(lats)*1000 if lats else 0):.0f}ms "
                          f"max={(max(lats)*1000 if lats else 0):.0f}ms "
-                         f"interval={backoff:.1f}s")
+                         f"interval={backoff:.1f}s{kind_line}")
             stats = {"n": 0, "codes": {}, "lat": [], "since": time.monotonic()}
         health.heartbeat()
         if args.once:
@@ -671,6 +849,7 @@ def main():
         end = time.monotonic() + max(0.0, backoff - (time.monotonic() - tick))
         while not stop["flag"] and time.monotonic() < end:
             time.sleep(min(0.2, end - time.monotonic()))
+    workers.shutdown(wait=True)  # let in-flight LLM verdicts finish sending
     logging.info("Bye.")
 
 
