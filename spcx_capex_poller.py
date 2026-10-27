@@ -7,7 +7,7 @@ filings, fetches the primary document PLUS exhibits (earnings numbers usually
 live in an EX-99 press release, not the 8-K shell), extracts CAPEX
 (capital-expenditure) figures, and sends OWNER-ONLY Telegram alerts.
 
-An LLM second opinion (Groq Llama 3.3 70B) evaluates the capex figures
+An LLM second opinion (Groq gpt-oss-120b) evaluates the capex figures
 against Street benchmarks supplied by the owner and also watches for any
 notion of a Tesla (TSLA) merger/acquisition. The LLM runs AFTER the primary
 regex alert has been sent (never delays it) and reports in a separate
@@ -57,7 +57,7 @@ CONFIG_FILENAME = "config.env"
 # Max exhibit documents fetched per filing (primary doc + this many extras).
 MAX_EXHIBITS = 4
 # LLM input cap. 10-Qs are long and capex tables sit deep in the cash-flow
-# statement, so this is much larger than the MSTR poller's cap. Llama 3.3 has
+# statement, so this is much larger than the MSTR poller's cap. gpt-oss-120b has
 # a 128k-token context; 60k chars ≈ 15-20k tokens.
 MAX_LLM_CHARS = 60000
 
@@ -427,11 +427,11 @@ def notify_owner(token: Optional[str], chat_id: Optional[str], text: str) -> Non
 
 
 # ----------------------------------------------------------------------------
-# LLM analysis (Groq, Llama 3.3 70B) — owner's decision rule encoded verbatim
+# LLM analysis (Groq, gpt-oss-120b) — owner's decision rule encoded verbatim
 # ----------------------------------------------------------------------------
 
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODEL = "llama-3.3-70b-versatile"
+GROQ_MODEL = "openai/gpt-oss-120b"
 
 LLM_SYSTEM_PROMPT = """You are a precise financial-disclosure analyst reading
 SEC filings of Space Exploration Technologies Corp (SPCX, "SpaceX").
@@ -472,9 +472,11 @@ facility, notes offering, or debt raise of $25B or more announced to fund
 investment triggers the verdict BY ITSELF, even if every stated capex figure
 is below its bar — a new $30B credit facility to fund infrastructure exceeds
 $25B, yes.
-FRONT-LOADING GUARD: if the same message shows a high quarter but full-year
-guidance reaffirmed in line at roughly $46B to $49B, answer no — timing, not
-acceleration.
+FRONT-LOADING GUARD (takes PRECEDENCE over the quarterly bar): if the same
+message shows a high quarter but full-year guidance reaffirmed in line at
+roughly $46B to $49B, answer no — timing, not acceleration. Apply this guard
+BEFORE concluding from a quarter figure: Q2 $16.5B with FY reaffirmed at
+$47B is NO SIGNAL, even though $16.5B alone would exceed the $16B bar.
 MIXED-FLASH GUARD: if the SAME message also reports revenue or profit beating
 its stated estimate by more than about ten percent, answer "MIXED NUMBERS" —
 a capex surprise inside a blowout quarter is a mixed signal, skip it.
@@ -544,7 +546,8 @@ def analyze_with_llm(text: str, regex_summary: str, api_key: str,
                       {"role": "system", "content": LLM_SYSTEM_PROMPT},
                       {"role": "user", "content": user_msg}],
                   "temperature": 0.0,
-                  "max_tokens": 700,
+                  "max_tokens": 4000,
+        "reasoning_effort": "low",
                   "response_format": {"type": "json_object"}},
             timeout=timeout,
         )
