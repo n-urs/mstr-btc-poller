@@ -502,6 +502,9 @@ def main():
     ap.add_argument("--health-fail-threshold", type=int, default=int(cfg_get("HEALTH_FAIL_THRESHOLD", 5)))
     ap.add_argument("--heartbeat-secs", type=int, default=int(cfg_get("HEARTBEAT_SECS", 300)))
     ap.add_argument("--log-file", default=cfg_get("LOG_FILE"))
+    ap.add_argument("--log-each-poll", action="store_true",
+                    default=cfg_get("DART_LOG_EACH_POLL", "").lower() in ("1", "true", "yes"),
+                    help="Log every RSS poll (status + latency). Default: per-minute summary only.")
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s",
@@ -581,10 +584,20 @@ def main():
     logging.info(f"Polling DART RSS for corp {args.corp_code} every {args.interval:.1f}s; "
                  f"{len(seen)} seen; LLM={args.groq_model}; owner-only alerts.")
     backoff = args.interval
+    # Poll instrumentation: every poll is counted; a compact summary line is
+    # logged each minute (status histogram, latency avg/max) so a creeping
+    # throttle (slower responses, 403/429s) is visible before it bites.
+    stats = {"n": 0, "codes": {}, "lat": [], "since": time.monotonic()}
     while not stop["flag"]:
         tick = time.monotonic()
         try:
+            t_poll = time.monotonic()
             items = fetch_rss(session, args.corp_code)
+            lat = time.monotonic() - t_poll
+            stats["n"] += 1; stats["lat"].append(lat)
+            stats["codes"]["200"] = stats["codes"].get("200", 0) + 1
+            if args.log_each_poll:
+                logging.info(f"poll 200 {lat*1000:.0f}ms items={len(items)}")
             backoff = args.interval
             health.ok()
             for rcp, title, pub in reversed([i for i in items if i[0] not in seen]):
@@ -600,16 +613,31 @@ def main():
                 save_state(state)
         except requests.HTTPError as e:
             code = e.response.status_code if e.response is not None else "?"
-            if code in (429, 503):
-                backoff = min(backoff * 2, 60.0)
-            logging.warning(f"HTTP {code}: {e}")
+            stats["n"] += 1
+            stats["codes"][str(code)] = stats["codes"].get(str(code), 0) + 1
+            if code in (403, 429, 500, 502, 503):
+                backoff = min(max(backoff, args.interval) * 2, 60.0)
+                ra = e.response.headers.get("Retry-After") if e.response is not None else None
+                logging.warning(f"HTTP {code} from DART — likely throttling; backing off to "
+                                f"{backoff:.0f}s" + (f" (Retry-After={ra})" if ra else ""))
+            else:
+                logging.warning(f"HTTP {code}: {e}")
             health.fail(f"HTTP {code}")
         except requests.RequestException as e:
+            stats["n"] += 1
+            stats["codes"][type(e).__name__] = stats["codes"].get(type(e).__name__, 0) + 1
             logging.warning(f"Network error: {e}")
             health.fail(type(e).__name__)
         except Exception as e:
             logging.exception(f"Unexpected: {e}")
             health.fail(type(e).__name__)
+        if time.monotonic() - stats["since"] >= 60:
+            lats = stats["lat"]
+            logging.info(f"📊 last 60s: polls={stats['n']} codes={stats['codes']} "
+                         f"latency avg={(sum(lats)/len(lats)*1000 if lats else 0):.0f}ms "
+                         f"max={(max(lats)*1000 if lats else 0):.0f}ms "
+                         f"interval={backoff:.1f}s")
+            stats = {"n": 0, "codes": {}, "lat": [], "since": time.monotonic()}
         health.heartbeat()
         if args.once:
             break
