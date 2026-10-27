@@ -495,10 +495,10 @@ def main():
     ap.add_argument("--groq-model", default=cfg_get("GROQ_MODEL", "openai/gpt-oss-120b"))
     ap.add_argument("--llm-timeout", type=float, default=float(cfg_get("LLM_TIMEOUT", 45)))
     ap.add_argument("--openai-api-key", default=cfg_get("OPENAI_API_KEY"))
-    ap.add_argument("--openai-model", default=cfg_get("OPENAI_MODEL", "sol-6.1"))
+    ap.add_argument("--openai-model", default=cfg_get("OPENAI_MODEL", "gpt-6.1-sol"))
     ap.add_argument("--openai-reasoning-effort", default=cfg_get("OPENAI_REASONING_EFFORT", "low"))
     ap.add_argument("--openai-extra-json", default=cfg_get("OPENAI_EXTRA_JSON", ""),
-                    help='Extra JSON merged into the OpenAI request body, e.g. {"service_tier":"ultrafast"}')
+                    help='Extra JSON merged into the OpenAI request body, e.g. {"service_tier":"fast"}')
     ap.add_argument("--health-fail-threshold", type=int, default=int(cfg_get("HEALTH_FAIL_THRESHOLD", 5)))
     ap.add_argument("--heartbeat-secs", type=int, default=int(cfg_get("HEARTBEAT_SECS", 300)))
     ap.add_argument("--log-file", default=cfg_get("LOG_FILE"))
