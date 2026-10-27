@@ -1172,11 +1172,11 @@ def telegram_notify_all(token: str, configured_chat_id: Optional[str],
 
 
 # ----------------------------------------------------------------------------
-# LLM analysis (Groq, Llama 3.3 70B)
+# LLM analysis (Groq, gpt-oss-120b)
 # ----------------------------------------------------------------------------
 
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODEL = "llama-3.3-70b-versatile"
+GROQ_MODEL = "openai/gpt-oss-120b"
 
 LLM_SYSTEM_PROMPT = """You are a precise financial-disclosure analyst.
 
@@ -1226,7 +1226,7 @@ Example (sale + new asset):
 
 def analyze_with_llm(html: str, regex_summary: str, api_key: str,
                      timeout: float = 15.0) -> Optional[dict]:
-    """Send the cleaned filing text to Groq's Llama 3.3 70B for a sale check.
+    """Send the cleaned filing text to Groq's gpt-oss-120b for a sale check.
     Returns parsed JSON dict or None on any failure. Never raises."""
     if not api_key:
         return None
@@ -1258,7 +1258,8 @@ def analyze_with_llm(html: str, regex_summary: str, api_key: str,
             {"role": "user", "content": user_msg},
         ],
         "temperature": 0.0,           # deterministic
-        "max_tokens": 300,
+        "max_tokens": 2000,
+        "reasoning_effort": "low",
         "response_format": {"type": "json_object"},
     }
     try:
@@ -1476,7 +1477,7 @@ def main():
                     default=cfg_get("NO_AUDIBLE", "").lower() in ("1", "true", "yes"),
                     help="Disable audible beep alerts (Windows: winsound; other: terminal BEL).")
     ap.add_argument("--groq-api-key", default=cfg_get("GROQ_API_KEY"),
-                    help="If set, send each new BTC update to Groq's Llama 3.3 70B "
+                    help="If set, send each new BTC update to Groq's gpt-oss-120b "
                          "for an independent second-opinion sale check.")
     ap.add_argument("--llm-timeout", type=float,
                     default=float(cfg_get("LLM_TIMEOUT", 15)),
@@ -1888,7 +1889,7 @@ def main():
                                     args.telegram_chat_id, state, msg)
 
         # ----------------------------------------------------------------
-        # LLM second-opinion analysis (Groq, Llama 3.3 70B).
+        # LLM second-opinion analysis (Groq, gpt-oss-120b).
         # Runs on EVERY new 8-K — including non-BTC filings, so a
         # novel-wording new-asset disclosure can't slip past the
         # regex layers unseen. Always AFTER the primary regex

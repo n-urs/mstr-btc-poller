@@ -358,7 +358,51 @@ def analyze_with_llm(text: str, title: str, api_key: str, model: str,
         return None
 
 
-def format_llm_message(llm: dict) -> str:
+OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
+
+
+def analyze_with_openai(text: str, title: str, api_key: str, model: str,
+                        reasoning_effort: str = "low", extra_json: str = "",
+                        timeout: float = 45.0):
+    """Second, independent opinion from OpenAI. Same prompt and JSON schema as
+    the Groq pass. Model / effort / extra body fields come from config so the
+    exact strings can be corrected without a code change. Returns
+    (parsed_dict_or_None, error_string_or_None)."""
+    if not api_key:
+        return None, "OPENAI_API_KEY not set"
+    body = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": LLM_SYSTEM_PROMPT},
+            {"role": "user", "content": f"Filing title: {title}\n\nFiling text:\n\n{build_llm_input(text)}"},
+        ],
+        "response_format": {"type": "json_object"},
+    }
+    if reasoning_effort:
+        body["reasoning_effort"] = reasoning_effort
+    if extra_json:
+        try:
+            body.update(json.loads(extra_json))
+        except Exception as e:
+            return None, f"OPENAI_EXTRA_JSON is not valid JSON: {e}"
+    try:
+        r = requests.post(OPENAI_API_URL,
+                          headers={"Authorization": f"Bearer {api_key}",
+                                   "Content-Type": "application/json"},
+                          json=body, timeout=timeout)
+        if r.status_code >= 400:
+            try:
+                detail = r.json().get("error", {}).get("message", r.text[:300])
+            except Exception:
+                detail = r.text[:300]
+            return None, f"HTTP {r.status_code}: {detail}"
+        parsed = json.loads(r.json()["choices"][0]["message"]["content"])
+        return (parsed if isinstance(parsed, dict) else None), None
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}"
+
+
+def format_llm_message(llm: dict, engine: str = "🤖") -> str:
     present = bool(llm.get("ads_info_present"))
     status = llm.get("ads_status") or ""
     icon = {"decided": "🔴", "under_review": "🟠", "denied_or_no_plan": "🟢",
@@ -367,7 +411,7 @@ def format_llm_message(llm: dict) -> str:
     two = [l.strip() for l in summary.split("\n") if l.strip()][:2]
     while len(two) < 2:
         two.append(llm.get("ads_details") or llm.get("filing_summary") or "")
-    lines = [f"🤖 ADS/ADR issuance: {'PRESENT' if present else 'NONE'} {icon}"
+    lines = [f"{engine} ADS/ADR issuance: {'PRESENT' if present else 'NONE'} {icon}"
              + (f" ({status.replace('_', ' ')})" if present and status else "")
              + f"  [conf: {llm.get('confidence', '?')}]",
              f"1️⃣ {two[0]}",
@@ -450,6 +494,11 @@ def main():
     ap.add_argument("--groq-api-key", default=cfg_get("GROQ_API_KEY"))
     ap.add_argument("--groq-model", default=cfg_get("GROQ_MODEL", "openai/gpt-oss-120b"))
     ap.add_argument("--llm-timeout", type=float, default=float(cfg_get("LLM_TIMEOUT", 45)))
+    ap.add_argument("--openai-api-key", default=cfg_get("OPENAI_API_KEY"))
+    ap.add_argument("--openai-model", default=cfg_get("OPENAI_MODEL", "sol-6.1"))
+    ap.add_argument("--openai-reasoning-effort", default=cfg_get("OPENAI_REASONING_EFFORT", "low"))
+    ap.add_argument("--openai-extra-json", default=cfg_get("OPENAI_EXTRA_JSON", ""),
+                    help='Extra JSON merged into the OpenAI request body, e.g. {"service_tier":"ultrafast"}')
     ap.add_argument("--health-fail-threshold", type=int, default=int(cfg_get("HEALTH_FAIL_THRESHOLD", 5)))
     ap.add_argument("--heartbeat-secs", type=int, default=int(cfg_get("HEARTBEAT_SECS", 300)))
     ap.add_argument("--log-file", default=cfg_get("LOG_FILE"))
@@ -476,10 +525,21 @@ def main():
             notify_owner(args.telegram_token, args.telegram_chat_id, msg1)
         if args.groq_api_key and len(text) >= 40:
             llm = analyze_with_llm(text, title, args.groq_api_key, args.groq_model, args.llm_timeout)
-            msg2 = format_llm_message(llm) if llm else "🤖 LLM call failed — no answer for this filing; read it manually."
+            msg2 = (format_llm_message(llm, f"🤖 {args.groq_model}") if llm
+                    else f"🤖 {args.groq_model} call failed — no answer for this filing; read it manually.")
             logging.info(msg2)
             if notify:
                 notify_owner(args.telegram_token, args.telegram_chat_id, msg2)
+        # Second, independent opinion (OpenAI) — its own separate alert.
+        if len(text) >= 40 and (args.openai_api_key or args.openai_model):
+            oai, err = analyze_with_openai(text, title, args.openai_api_key,
+                                           args.openai_model, args.openai_reasoning_effort,
+                                           args.openai_extra_json, args.llm_timeout)
+            msg3 = (format_llm_message(oai, f"🧠 {args.openai_model}") if oai
+                    else f"🧠 {args.openai_model} unavailable — {err}")
+            logging.info(msg3)
+            if notify and (oai or args.openai_api_key):
+                notify_owner(args.telegram_token, args.telegram_chat_id, msg3)
         return hits
 
     if args.test_telegram:
