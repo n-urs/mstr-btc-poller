@@ -502,6 +502,10 @@ def main():
     ap.add_argument("--health-fail-threshold", type=int, default=int(cfg_get("HEALTH_FAIL_THRESHOLD", 5)))
     ap.add_argument("--heartbeat-secs", type=int, default=int(cfg_get("HEARTBEAT_SECS", 300)))
     ap.add_argument("--log-file", default=cfg_get("LOG_FILE"))
+    ap.add_argument("--safe-interval", type=float, default=float(cfg_get("DART_SAFE_INTERVAL", 5.0)),
+                    help="Interval to fall back to after a throttle signal (403/429/5xx). Default 5s.")
+    ap.add_argument("--safe-cooldown", type=float, default=float(cfg_get("DART_SAFE_COOLDOWN_SECS", 600)),
+                    help="Seconds of clean polling at the safe interval before returning to the fast interval. Default 600.")
     ap.add_argument("--log-each-poll", action="store_true",
                     default=cfg_get("DART_LOG_EACH_POLL", "").lower() in ("1", "true", "yes"),
                     help="Log every RSS poll (status + latency). Default: per-minute summary only.")
@@ -588,6 +592,11 @@ def main():
     # logged each minute (status histogram, latency avg/max) so a creeping
     # throttle (slower responses, 403/429s) is visible before it bites.
     stats = {"n": 0, "codes": {}, "lat": [], "since": time.monotonic()}
+    # Penalty box: after any throttle signal we poll at the SAFE interval and
+    # stay there until `safe_until` — a snap-back to the fast interval on the
+    # first 200 would just re-trip the limit. Repeated failures while boxed
+    # still back off exponentially (capped at 60s).
+    safe_until = 0.0
     while not stop["flag"]:
         tick = time.monotonic()
         try:
@@ -598,7 +607,16 @@ def main():
             stats["codes"]["200"] = stats["codes"].get("200", 0) + 1
             if args.log_each_poll:
                 logging.info(f"poll 200 {lat*1000:.0f}ms items={len(items)}")
-            backoff = args.interval
+            if time.monotonic() < safe_until:
+                backoff = args.safe_interval
+            else:
+                if safe_until and backoff != args.interval:
+                    logging.info(f"✅ cooldown complete — returning to {args.interval:.1f}s polling.")
+                    notify_owner(args.telegram_token, args.telegram_chat_id,
+                                 f"✅ SK hynix watcher: DART throttle cooldown over, back to "
+                                 f"{args.interval:.1f}s polling.")
+                safe_until = 0.0
+                backoff = args.interval
             health.ok()
             for rcp, title, pub in reversed([i for i in items if i[0] not in seen]):
                 try:
@@ -616,10 +634,19 @@ def main():
             stats["n"] += 1
             stats["codes"][str(code)] = stats["codes"].get(str(code), 0) + 1
             if code in (403, 429, 500, 502, 503):
-                backoff = min(max(backoff, args.interval) * 2, 60.0)
                 ra = e.response.headers.get("Retry-After") if e.response is not None else None
-                logging.warning(f"HTTP {code} from DART — likely throttling; backing off to "
-                                f"{backoff:.0f}s" + (f" (Retry-After={ra})" if ra else ""))
+                entering = time.monotonic() >= safe_until
+                safe_until = time.monotonic() + args.safe_cooldown
+                backoff = (args.safe_interval if entering
+                           else min(max(backoff, args.safe_interval) * 2, 60.0))
+                logging.warning(f"HTTP {code} from DART — throttle signal; polling at "
+                                f"{backoff:.0f}s for the next {args.safe_cooldown:.0f}s"
+                                + (f" (Retry-After={ra})" if ra else ""))
+                if entering:
+                    notify_owner(args.telegram_token, args.telegram_chat_id,
+                                 f"⚠️ SK hynix watcher: DART returned HTTP {code} — dropped to "
+                                 f"{args.safe_interval:.0f}s polling for {args.safe_cooldown/60:.0f} min "
+                                 f"(auto-returns to {args.interval:.1f}s after a clean cooldown).")
             else:
                 logging.warning(f"HTTP {code}: {e}")
             health.fail(f"HTTP {code}")
