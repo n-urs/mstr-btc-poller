@@ -451,15 +451,19 @@ def analyze_with_openai(text: str, title: str, api_key: str, model: str,
 def format_llm_message(llm: dict, engine: str = "🤖") -> str:
     present = bool(llm.get("ads_info_present"))
     status = llm.get("ads_status") or ""
-    icon = {"decided": "🔴", "under_review": "🟠", "denied_or_no_plan": "🟢",
-            "mentioned_other": "🟡"}.get(status, "🟢" if not present else "🟡")
+    # Nothing about ADS/ADR in the filing is grey, whatever status the model attached.
+    # Colours are kept for filings that do say something (green = explicitly denied / no plan).
+    icon = "⚪" if not present else {"decided": "🔴", "under_review": "🟠", "denied_or_no_plan": "🟢",
+                                    "mentioned_other": "🟡"}.get(status, "🟡")
     summary = (llm.get("ads_summary") or "").strip()
     two = [l.strip() for l in summary.split("\n") if l.strip()][:2]
     while len(two) < 2:
         two.append(llm.get("ads_details") or llm.get("filing_summary") or "")
-    lines = [f"{engine} ADS/ADR issuance: {'PRESENT' if present else 'NONE'} {icon}"
+    # The verdict comes first: it is what the phone notification shows.
+    lines = [f"{'PRESENT' if present else 'NONE'} {icon}"
              + (f" ({status.replace('_', ' ')})" if present and status else "")
-             + f"  [conf: {llm.get('confidence', '?')}]",
+             + f" [conf: {llm.get('confidence', '?')}]",
+             f"{engine} ADS/ADR issuance",
              f"1️⃣ {two[0]}",
              f"2️⃣ {two[1]}"]
     if present and llm.get("ads_details"):
